@@ -1,0 +1,88 @@
+{
+  "study_module": "QC2.my_fit_model",
+
+  "input": {
+    "file": "/path/to/your_spectrum.h5",
+    "lattice_size": 48,
+    "continuum": true,
+    "cutoff": 10.0
+  },
+
+  "data": [
+    {
+      "momentum": [0, 0, 0],
+      "irreps": {
+        "T1g": [0, 1, 2]
+      }
+    },
+    {
+      "momentum": [0, 0, 1],
+      "irreps": {
+        "A2": [0, 1],
+        "E":  [0, 1]
+      }
+    },
+    {
+      "momentum": [1, 1, 0],
+      "irreps": {
+        "A2": [0, 1],
+        "B1": [0],
+        "B2": [0]
+      }
+    }
+  ],
+
+  "quantum_numbers": {
+    "channels": [
+      {
+        "name": "NN_1S0",
+        "enabled": true,
+        "k_matrix": "polynomial",
+        "params": [
+          { "name": "c0", "initial": -0.2 },
+          { "name": "c1", "initial":  0.7 }
+        ]
+      }
+    ]
+  },
+
+  "fit": {
+    "MN": 1.0,
+    "MK": 1.0,
+    "strategy":    "nelder-mead",
+    "n_starts":    20,
+    "n_refine":    400,
+    "step_mode":   "adaptive",
+    "xatol":       1e-6,
+    "fatol":       1e-6,
+    "n_maxiter":   10000,
+    "auto_p0":     false,
+    "skip_minimization": false
+  },
+
+  "plot": {
+    "enabled":       true,
+    "save_path":     "./Images/Spectrum/fit_c103_{study_module}.pdf",
+    "save_timestamp": true,
+    "com_frame":     true,
+    "show":          false,
+    "ylabel":        "$E^\\star / m_N$",
+    "show_ni":       true,
+    "show_level_labels": true,
+    "bmatrix_preview": {
+      "enabled":    false,
+      "save_path":  "./Images/Spectrum/bmatrix_preview_c103.pdf",
+      "n_sweep":    800,
+      "clip":       30.0,
+      "y_scale_mode": "data_central",
+      "show":       false
+    }
+  },
+
+  "logging": {
+    "enabled": false,
+    "dir":     "./logs/c103",
+    "prefix":  "c103_hpw",
+    "level":   "INFO"
+  }
+}

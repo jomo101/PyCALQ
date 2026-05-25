@@ -1,0 +1,46 @@
+tasks:
+  # ── Option A: auto-config mode ─────────────────────────────────────────────
+  # No JSON file needed. The HDF5 is found from data_file (or auto-discovered
+  # from the fit_spectrum output directory if data_file is omitted).
+  # The data block (momenta / irreps / levels) is built from 'scattering'.
+  - single_channel_fit:
+      data_file: /path/to/your_spectrum.hdf5   # omit to auto-discover from project dir
+
+      scattering:
+        'N(0)_ref,pi(0)_ref':
+          PSQ0:
+            - G1u: [0, 1, 2]
+          PSQ1:
+            - G1: [0, 1]
+          PSQ2:
+            - G: [0, 1]
+          PSQ3:
+            - G: [0, 1]
+
+      # K-matrix / BMAT channel setup (physics-specific, fill in your values)
+      quantum_numbers:
+        channels:
+          - name: NN_1S0
+            enabled: true
+            k_matrix: polynomial
+            params:
+              - {name: c0, initial: -0.2}
+              - {name: c1, initial: 0.7}
+
+      # fit settings (all optional – defaults shown)
+      MN: 1.0
+      MK: 1.0
+      strategy: nelder-mead
+      n_starts: 20
+      n_refine: 400
+      auto_p0: false
+      cutoff: 10.0
+      study_module: QC2.my_fit_model
+      bmat_preview_only: false   # set true to only plot B-matrix preview
+
+  # ── Option B: pre-made JSON mode ───────────────────────────────────────────
+  # Provide the full GenericFitRunner JSON config directly (see c103_hpw_fit.json).
+  # - single_channel_fit:
+  #     config_file: test_configs/c103_hpw_fit.json
+  #     study_module: QC2.my_fit_model   # optional override
+  #     bmat_preview_only: false

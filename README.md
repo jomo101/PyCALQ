@@ -80,6 +80,7 @@ where `[taskn]` should be replaced with one of the following:
 - `rotate_corrs`
 - `fit_spectrum`
 - `compare_spectrums`
+- `single_channel_fit`
 and `[taskn_configs]` should be replaced with the required configurations for each task (described below).
 Each tasks functions and configuration input are outlined in the following sections. Tasks may be in any order
 and multiple of any task, but the input will be sorted according to the list above. If multiple are included, 
@@ -418,13 +419,105 @@ Unique task input descriptions:
 - plot_deltaE - include additional plots that compare shifts from non-interacting levels. Only possible if provided in data
 
 ### Single Channel Fit
-Using the fit results of the fit_spectrum task, or a linked energy fit result (hdf5 format as default).
-Uses the spectrum in format (PSQ, Channel, Energy/ref energy) as input to fit K-matrix for Lüscher QC.
+Using the finite-volume spectrum produced by `fit_spectrum` (or any compatible HDF5 file), fits a
+K-matrix parametrization to the Lüscher quantization condition using the HPW B-matrix (BMAT) method.
+The fit is driven by `QC2/run_HPW_fit.py` (`GenericFitRunner`) and the study module `QC2/my_fit_model.py`.
 
-Current Mandatory Task Input:
-- data_file: Location of hdf5 data file 
-- channel: Single Channel with two hadrons available in the data file
-- irreps : Irreps used in the fit, with default as the lowest energy level in each irrep 
+Two usage modes are supported.
+
+#### Mode 1 – Auto-config (recommended)
+All settings live in the tasks YAML. A GenericFitRunner JSON config is generated automatically
+and saved to the task log directory. The HDF5 input file is found automatically from the
+`fit_spectrum` data directory if `data_file` is omitted.
+
+Quantum numbers (`twoJ`, `twoS`) are derived from the particle names in `general/particles.py`
+using the `scattering` channel string. The partial wave `L` defaults to `0` (S-wave) and can
+be overridden. Only the K-matrix initial parameter guesses (`params`) must be provided.
+
+```yaml
+- single_channel_fit:
+    data_file: /path/to/spectrum.hdf5   # omit to auto-discover from fit_spectrum output
+
+    scattering:
+      'N(0)_ref,pi(0)_ref':             # two hadrons separated by comma
+        PSQ0:
+          - G1u: [0, 1, 2]             # irrep: list of level indices
+        PSQ1:
+          - G1: [0, 1]
+        PSQ2:
+          - G: [0, 1]
+        PSQ3:
+          - G: [0, 1]
+
+    # twoS is auto-derived from particles.py; twoJ = |2L - twoS| by default
+    L: 0                # partial wave integer (0=S, 1=P, 2=D, ...)
+    k_matrix: polynomial  # polynomial | ERE | zero
+    params:             # K-matrix initial guesses (required)
+      - {name: c0, initial: -0.2}
+      - {name: c1, initial: 0.7}
+
+    # Optional overrides
+    # twoS: 1
+    # twoJ: 1
+
+    # Fit settings (all optional – defaults shown)
+    MN: 1.0
+    MK: 1.0
+    strategy: nelder-mead  # nelder-mead | powell | ...
+    n_starts: 20
+    n_refine: 400
+    auto_p0: false         # estimate initial params from B-matrix before fit
+    cutoff: 10.0           # discard levels with E_cm/m_N above this value
+    study_module: QC2.my_fit_model
+    bmat_preview_only: false  # true = only plot B-matrix preview, skip fit
+```
+
+Short descriptions of unique task inputs:
+- `data_file` - (str) path to the HDF5 spectrum file. Auto-discovered from the `fit_spectrum`
+  data directory if omitted.
+- `scattering` - (dict) channel → PSQ → list of `{irrep: [level_indices]}`. Drives both the
+  data selection and the quantum-number inference.
+- `L` - (int or str) orbital angular momentum of the partial wave: `0`/`'S'`, `1`/`'P'`, `2`/`'D'`, …
+- `k_matrix` - (str) K-matrix parametrization type for the channel.
+- `params` - (list) K-matrix initial parameter guesses, each as `{name: <str>, initial: <float>}`.
+- `twoS` - (int) override auto-derived total spin (2×S). Needed when multiple spin states are
+  possible (e.g. NN).
+- `twoJ` - (int) override auto-derived total angular momentum (2×J).
+- `MN`, `MK` - (float) reference masses for nucleon and kaon in units of `m_ref`.
+- `strategy` - (str) optimizer strategy passed to `scipy.optimize.minimize`.
+- `n_starts` - (int) number of random restarts for the minimizer.
+- `n_refine` - (int) grid resolution for root-finding.
+- `auto_p0` - (bool) if true, estimates initial parameters from the B-matrix before minimizing.
+- `cutoff` - (float) energy cutoff; levels above this are excluded from the fit.
+- `study_module` - (str) Python import path for the fit study module.
+- `bmat_preview_only` - (bool) if true, produces only the B-matrix preview plot and skips the fit.
+
+#### Mode 2 – Pre-made JSON config
+For full control, or when reusing a config from a previous standalone run, point to a
+pre-made GenericFitRunner JSON file:
+
+```yaml
+- single_channel_fit:
+    config_file: test_configs/c103_hpw_fit.json
+    study_module: QC2.my_fit_model   # optional override of value in JSON
+    bmat_preview_only: false
+```
+
+See `test_configs/c103_hpw_fit.json` for a fully annotated example of the JSON format.
+
+#### Standalone usage (no PyCALQ pipeline)
+`run_HPW_fit.py` can also be run directly from the command line with only a JSON config:
+
+```bash
+# Full fit
+python QC2/run_HPW_fit.py test_configs/c103_hpw_fit.json
+
+# B-matrix preview only (no minimization)
+python QC2/run_HPW_fit.py test_configs/c103_hpw_fit.json --bmat-preview-only
+
+# Override the study module
+python QC2/run_HPW_fit.py test_configs/c103_hpw_fit.json --module QC2.my_fit_model
+```
 
 
 
