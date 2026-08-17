@@ -3,6 +3,22 @@ Correlator Analysis and Luscher Quantization Condition.
 
 Full analysis chain of the finite volume spectrum from two-point correlators to phase-shifts and other infinite-volume observables using the Lüscher formalism for two-particle scattering channels below the nearest inelastic scattering threshold.
 
+The chain has two halves, and they can be used independently:
+
+- **Correlator analysis** (`fvspectrum/`) — preview, average and rotate correlators, fit the
+  spectrum, and compare spectra. Built on [sigmond](https://github.com/andrewhanlon/sigmond/tree/pip).
+- **Lüscher quantization condition** (`QC2/`) — fit a K-matrix parametrization to a finite-volume
+  spectrum through the Lüscher QC using the HPW B-matrix, and extract phase shifts, mixing angles
+  and poles. Handles coupled channels (e.g. ³S₁–³D₁ with the mixing angle ε₁), bootstrap errors,
+  and a parallel engine that makes large multi-wave fits and N=1000 bootstraps tractable.
+
+Each half runs without the other's dependencies: `QC2` starts from an HDF5 spectrum, so it needs
+`BMat` but not sigmond, and the correlator tasks need sigmond but not `BMat`.
+
+Tasks are configured in YAML and run through a single driver, writing their outputs — data, logs,
+figures and a summary PDF — into a structured project directory. See
+[Single Channel Fit](#single-channel-fit) for the Lüscher side.
+
 ## Prerequisites
 
 - [sigmond pybindings (pip branch)](https://github.com/andrewhanlon/sigmond/tree/pip) — needed by
@@ -646,7 +662,8 @@ class Task(Enum): #encode tasks into enum
     fit_spectrum = 3
     toy_corrs = 4
     compare_spectrums = 5
-    new_task = 6
+    single_channel_fit = 6
+    new_task = 7
 ```
 
 Then, open `pycalq.py` and add the task to `DEFAULT_TASKS`, `TASK_MAP`, and `TASK_DOC` in the same manner as the current tasks. If the task uses sigmond mcobshandler to manage data and memory, add the task to `SIGMOND_TASKS` and update the `dependencies` and `raw_data_dependence` variables at the top of `fvspectrum/sigmond_project_handler.py` accordingly.
@@ -658,5 +675,12 @@ Items that need to be fixed:
  - Spectrum task: the estimates for interacting and noninteracting need to be separated because they occasionally have the same channel name. 
  - spectrum task: the fits to nonzero momentum single hadrons do not need to be calculated unless calculating the operator overlaps. if operator overlaps are turned off, then do not calculate these fits. 
 
+ - Lüscher fit: the runner writes its `fit_results_<channel>.png` results image even when
+   `plot: false` is set. The same numbers are in `data/fit_results.json`.
+ - Lüscher fit: no sample spectrum ships with the repo, so the `test_configs/nn_3s1_*` example
+   needs `data_file` pointed at your own HDF5 before it will run.
+
 Desired updates:
  - internal setup for slurm or other scheduler systems
+ - Lüscher fit: expose the bootstrap sub-block through the auto-config YAML with the same
+   validation as the other fit settings (it currently passes through untouched).

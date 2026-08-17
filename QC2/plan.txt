@@ -1,3 +1,0 @@
-Luscher code converts finite-volume stationary energy states into infinite-volume observables. I have code specific for Sigma-Pi and Nk seperate, and coupled-channel.
-Tasks:
-- 1. 

@@ -10,7 +10,7 @@ pandas==2.1.2
 PyLaTeX==1.4.2
 PyYAML==5.4.1
 regex==2023.10.3
-scipy==1.8.0
+scipy>=1.8
 shutilwhich==1.1.0
 sortedcontainers==2.4.0
 soupsieve==2.3.1
