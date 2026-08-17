@@ -548,8 +548,10 @@ Short descriptions of unique task inputs:
   selection and the quantum-number inference. Omit to fit every level found in the file.
 - `L` - (int or str) orbital angular momentum: `0`/`'S'`, `1`/`'P'`, `2`/`'D'`, …
 - `twoS`, `twoJ` - (int) 2×S and 2×J. `twoS` is inferred from `particles.py` where unambiguous.
-- `k_matrix` - (str) parametrization: `poly_s` (Σ cₙsⁿ), `polynomial` (Σ cₙp²ⁿ), `constant`,
-  `linear`, `ere`, `ere1_vs`, `epsilon` (mixing angle), `zero`.
+- `k_matrix` - (str) parametrization: `poly_s` (Σ cₙsⁿ in s), `polynomial` (Σ cₙp²ⁿ), `constant`,
+  `linear`, `ere` (effective range), `ere1_vs` (polynomial, pole-capable form of
+  k^(2ℓ+1)·cotδ), `epsilon` (mixing angle), `zero` (switch a coupled sub-block off).
+  `ere_inv` and `ere1_vs_inv` give the reciprocal of the corresponding form.
 - `params` - (list) K-matrix initial guesses, each `{name: <str>, initial: <float>}`.
 - `quantum_numbers` - (dict) explicit channel list; overrides all inference above and is the only
   way to express coupled blocks (see below).
