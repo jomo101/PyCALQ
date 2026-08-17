@@ -46,6 +46,69 @@ class GenericFitRunner:
         self.logger.propagate = False
         self.logging_enabled = False
         self.bmat_preview_only = bmat_preview_only
+        # Populated by _export_results() at the end of a fit.
+        self.results = None
+
+    def _export_results(self, par, labels, chi2_val, dof, converged,
+                        num_data_points, num_parameters, parametrization_name,
+                        vijmat=None):
+        """Record the fit results on the runner, and write them as JSON if asked.
+
+        Downstream tooling (the campaign report builders, the PyCALQ task
+        wrapper) reads this instead of re-parsing the run log. Set the output
+        path with config["output"]["results_json"].
+        """
+        results = {
+            "study_module":    self.study_module_name,
+            "timestamp":       self.run_timestamp,
+            "parametrization": parametrization_name,
+            "converged":       bool(converged),
+            "chi2":            float(chi2_val),
+            "dof":             int(dof),
+            "chi2_per_dof":    (float(chi2_val) / dof) if dof else None,
+            "aic":             float(chi2_val - 2 * dof),
+            "num_data_points": int(num_data_points),
+            "num_parameters":  int(num_parameters),
+            "parameters":      [{"name": str(n), "value": float(v)}
+                                for n, v in zip(labels, par)],
+        }
+
+        if vijmat is not None:
+            vij = np.asarray(vijmat, dtype=float)
+            errors = np.sqrt(np.diag(vij))
+            for entry, err in zip(results["parameters"], errors):
+                entry["error"] = float(err)
+            results["covariance"] = [[float(x) for x in row] for row in vij]
+
+        self.results = results
+
+        out_path = self.config.get("output", {}).get("results_json")
+        if not out_path:
+            return results
+
+        try:
+            out_path = self._format_path_template(out_path)
+            out_dir = os.path.dirname(os.path.abspath(out_path))
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+            with open(out_path, "w", encoding="utf-8") as fh:
+                json.dump(results, fh, indent=2)
+            self._log(logging.INFO, "Wrote fit results: %s", out_path)
+        except Exception as exc:
+            self._log(logging.WARNING, "Could not write results JSON: %s", exc)
+
+        return results
+
+    def _format_path_template(self, template):
+        """Expand the {study_module} style placeholders used by plot save paths."""
+        try:
+            return template.format(
+                study_module=self.study_module_name,
+                study_model=self.study_module_name,
+                module=self.study_module_name,
+            )
+        except (KeyError, IndexError, ValueError):
+            return template
 
     def _load_study_module(self, module_name):
         model_file = self.config.get("model_file")
@@ -1350,6 +1413,12 @@ class GenericFitRunner:
             results_text += f"\nCov matrix of parameters\n{vijmat}\n"
             results_text += f"Errors on parameters\n{np.sqrt(np.diag(vijmat))}"
             results_text += f"\n{_residuals_text}"
+
+            self._export_results(
+                par, final_labels, chi2_val, dof, converged,
+                num_data_points, num_parameters, parametrization_name,
+                vijmat=vijmat,
+            )
             
             # Determine save path for results image (without timestamp)
             plot_cfg = self.config.get("plot", {})
@@ -1401,7 +1470,12 @@ class GenericFitRunner:
             for name, value in zip(final_labels, par):
                 results_text += f"Final fit {name:<28s} = {value:12.10g}\n"
             results_text += f"\n{_residuals_text}"
-            
+
+            self._export_results(
+                par, final_labels, chi2_val, dof, converged,
+                num_data_points, num_parameters, parametrization_name,
+            )
+
             # Determine save path for results image (without timestamp)
             plot_cfg = self.config.get("plot", {})
             if plot_cfg.get("enabled", True):

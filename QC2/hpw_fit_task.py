@@ -91,12 +91,30 @@ single_channel_fit:                 #required
     n_samples: 1000                     #not required #default: 1000
   n_workers: 8                      #not required #default: all cores (capped 8)
 
+  plot: true                        #not required #default: true
+  report: true                      #not required #default: true
+
 task input (mode 2 - pre-made JSON, full control)
 ---
 single_channel_fit:                 #required
   config_file: path/to/fit.json     #required for mode 2
   study_module: label               #not required #overrides the JSON value
   bmat_preview_only: false          #not required #default: false
+  respect_config_paths: false       #not required #default: false
+  plot: true                        #not required #default: true
+  report: true                      #not required #default: true
+
+outputs
+---
+  <project_dir>/<n>single_channel_fit/
+    data/fit_results.json      chi2, dof, AIC, parameters, errors, covariance
+    logs/hpw_fit_config.json   the fully-resolved config this run used
+    logs/hpw_fit_<stamp>.log   run log
+    plots/<channel>/           spectrum, Luscher, phase-shift and diagnostic
+                               figures, plus fit_summary.pdf
+
+  Output paths in a config_file are overridden so everything lands in the
+  project directory; set respect_config_paths: true to keep the JSON's paths.
 '''
 
 # Partial-wave label <-> integer L
@@ -427,15 +445,176 @@ def _build_hpw_config(task_params, proj_handler, general_configs):
     return config
 
 
+# Diagnostic plot blocks the runner enables by default; "plot: false" has to
+# switch each off by name.
+_PLOT_SUBBLOCKS = (
+    "quantization_condition",
+    "phase_shifts",
+    "wave_energies",
+    "luscher",
+    "fit_comparison",
+    "det_diagnostics",
+    "eigenvector_decomposition",
+    "bmatrix_preview",
+)
+
+
+def _apply_project_paths(config, proj_handler, plot_enabled=True,
+                         respect_config_paths=False):
+    """Point the runner's outputs at the PyCALQ project directory.
+
+    Matters most in config_file mode: a hand-written JSON carries absolute
+    paths, and without this the run happily writes its figures, log and
+    results outside the project tree entirely.
+
+    Only three keys need overriding. The runner funnels every figure path
+    through ``plot.figures_dir`` (keeping just the basename), so setting that
+    one key captures all of them.
+
+    Pass ``respect_config_paths: true`` in the task params to keep the JSON's
+    own paths -- useful when reproducing an existing run byte-for-byte.
+    """
+    plot_cfg = config.setdefault("plot", {})
+
+    # "plot: false" on the task disables the runner's plotting too, since the
+    # figures are made during run() rather than plot(). plot.enabled alone only
+    # gates the spectrum plot -- each diagnostic block defaults to on and has to
+    # be switched off by name.
+    if not plot_enabled:
+        plot_cfg["enabled"] = False
+        for block in _PLOT_SUBBLOCKS:
+            plot_cfg.setdefault(block, {})["enabled"] = False
+    plot_cfg.setdefault("enabled", True)
+    plot_cfg["show"] = False
+
+    if respect_config_paths:
+        logging.info("HPWFitTask: respect_config_paths set - leaving config output paths alone.")
+        return config
+
+    plot_cfg["figures_dir"] = proj_handler.plot_dir()
+
+    log_cfg = config.setdefault("logging", {})
+    log_cfg["enabled"] = True
+    log_cfg["dir"] = proj_handler.log_dir()
+    log_cfg.setdefault("prefix", "hpw_fit")
+    log_cfg.setdefault("level", "INFO")
+
+    config.setdefault("output", {})["results_json"] = os.path.join(
+        proj_handler.data_dir(), "fit_results.json"
+    )
+    return config
+
+
+# Figures the runner may produce, in the order they should appear in the
+# report. Matched against the tail of each filename.
+_FIGURE_ORDER = (
+    ("hpw_fit_spectrum",   "Fitted finite-volume spectrum"),
+    ("_results",           "Fit results"),
+    ("luscher",            r"L\"uscher $k\cot\delta$"),
+    ("_phase_shifts",      "Phase shifts"),
+    ("qc_",                "Quantization condition"),
+    ("omega_eigs",         "$\\Omega$ determinant and eigenvalues"),
+    ("_wave_energies",     "Wave-decomposed energies"),
+    ("bmatrix_preview",    "B-matrix preview"),
+)
+
+
+def _collect_figures(plot_dir):
+    """Return [(path, caption)] for the figures found, in report order."""
+    if not os.path.isdir(plot_dir):
+        return []
+
+    found = sorted(
+        os.path.join(plot_dir, f) for f in os.listdir(plot_dir)
+        if f.lower().endswith(('.pdf', '.png'))
+        and not f.lower().endswith('fit_summary.pdf')
+    )
+
+    ordered, used = [], set()
+    for token, caption in _FIGURE_ORDER:
+        for path in found:
+            if path in used:
+                continue
+            if token in os.path.basename(path):
+                ordered.append((path, caption))
+                used.add(path)
+    # Anything unrecognized still goes in, after the known figures.
+    ordered.extend((p, None) for p in found if p not in used)
+    return ordered
+
+
+def _tex_escape(text):
+    """Escape the characters that show up in channel and parameter names."""
+    out = str(text)
+    for char in ('\\', '_', '%', '&', '#', '$', '{', '}'):
+        out = out.replace(char, '\\' + char)
+    return out
+
+
+def _fill_report(report, results, figures, config):
+    """Populate the summary document: fit quality, parameters, then figures."""
+    if results:
+        report.append_section("Fit Summary")
+        report.summary_table(
+            ["Quantity", "Value"],
+            [
+                ["Parametrization", _tex_escape(results.get('parametrization', 'n/a'))],
+                ["Converged",       "yes" if results.get('converged') else "no"],
+                ["$\\chi^2$",       f"{results['chi2']:.6f}"],
+                ["d.o.f.",          f"{results['dof']}"],
+                ["$\\chi^2$/d.o.f.", f"{results['chi2_per_dof']:.6f}"],
+                ["AIC",             f"{results['aic']:.6f}"],
+                ["Data points",     f"{results['num_data_points']}"],
+                ["Fit parameters",  f"{results['num_parameters']}"],
+            ],
+            title="Fit quality",
+        )
+
+        params = results.get('parameters', [])
+        has_errors = any('error' in p for p in params)
+        headers = ["Parameter", "Value", "Error"] if has_errors else ["Parameter", "Value"]
+        rows = []
+        for p in params:
+            row = [_tex_escape(p['name']), f"{p['value']:.8g}"]
+            if has_errors:
+                row.append(f"{p['error']:.6g}" if 'error' in p else "--")
+            rows.append(row)
+        if rows:
+            report.summary_table(headers, rows, title="Best-fit parameters")
+
+    input_cfg = (config or {}).get('input', {})
+    if input_cfg:
+        report.append_section("Input")
+        report.summary_table(
+            ["Setting", "Value"],
+            [
+                ["Spectrum file", _tex_escape(os.path.basename(str(input_cfg.get('file', 'n/a'))))],
+                ["Lattice size",  _tex_escape(input_cfg.get('lattice_size', 'n/a'))],
+                ["Dispersion",    "continuum" if input_cfg.get('continuum', True) else "lattice"],
+                ["Cutoff $E^\\star/m_N$", _tex_escape(input_cfg.get('cutoff', 'n/a'))],
+            ],
+            title="Data and kinematics",
+        )
+
+    if figures:
+        report.append_section("Figures")
+        for path, caption in figures:
+            report.add_single_plot(path, caption=caption)
+
+
 class HPWFitTask:
     """Adapts GenericFitRunner to the PyCALQ task interface.
 
-    Mode 1 (``config_file``): the JSON is used as-is, giving access to every
-    fitter flag documented in the upstream FITTING_GUIDE.
+    Mode 1 (auto-config): a JSON config is generated from the task YAML plus
+    the project directory.
 
-    Mode 2 (auto-config): a JSON config is generated from the task YAML plus
-    the project directory, and written to the task log directory so the exact
-    inputs of a run stay reproducible.
+    Mode 2 (``config_file``): an existing JSON is loaded, giving access to
+    every fitter flag documented in the upstream FITTING_GUIDE.
+
+    In both modes the resolved config is redirected into the project directory
+    and written to the task log directory, so a run is reproducible from its
+    own output. ``run()`` performs the fit and writes results to ``data_dir()``;
+    ``plot()`` assembles the summary document from the figures it produced.
     """
 
     @property
@@ -445,20 +624,36 @@ class HPWFitTask:
     def __init__(self, task_name, proj_handler, general_configs, task_params):
         self.task_name = task_name
         self.proj_handler = proj_handler
-        task_params = task_params or {}
+        self.task_params = task_params = task_params or {}
+
+        # pycalq skips plot() when the task sets "plot: false", but this task's
+        # figures are produced by the runner inside run(). Read the flag here so
+        # the runner's own plotting can be switched off to match.
+        self.plot_enabled = bool(task_params.get('plot', True))
+        self.report_enabled = bool(task_params.get('report', True)) and self.plot_enabled
 
         if 'config_file' in task_params:
             config_path = task_params['config_file']
             if not os.path.isfile(config_path):
                 raise FileNotFoundError(f"HPWFitTask: config_file not found: {config_path}")
             logging.info(f"HPWFitTask: using provided config_file: {config_path}")
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config_dict = json.load(f)
         else:
             logging.info("HPWFitTask: no config_file provided - auto-generating JSON config.")
             config_dict = _build_hpw_config(task_params, proj_handler, general_configs)
-            config_path = os.path.join(proj_handler.log_dir(), 'hpw_fit_config.json')
-            with open(config_path, 'w', encoding='utf-8') as f:
-                json.dump(config_dict, f, indent=2)
-            logging.info(f"HPWFitTask: auto-generated config written to {config_path}")
+
+        # Both modes: outputs belong in the project directory, not wherever a
+        # hand-written JSON happens to point.
+        _apply_project_paths(config_dict, proj_handler, self.plot_enabled,
+                             respect_config_paths=bool(task_params.get('respect_config_paths', False)))
+
+        # Record the fully-resolved input, so a run is reproducible from its own
+        # log directory in either mode.
+        effective_path = os.path.join(proj_handler.log_dir(), 'hpw_fit_config.json')
+        with open(effective_path, 'w', encoding='utf-8') as f:
+            json.dump(config_dict, f, indent=2)
+        logging.info(f"HPWFitTask: effective config written to {effective_path}")
 
         # Number of worker processes for the parallel engine, read from the
         # environment by my_fit_model_par at pool construction time.
@@ -466,15 +661,62 @@ class HPWFitTask:
             os.environ['HPW_FIT_WORKERS'] = str(int(task_params['n_workers']))
 
         self._runner = GenericFitRunner(
-            config_path,
+            effective_path,
             study_module_override=task_params.get('study_module'),
             bmat_preview_only=bool(task_params.get('bmat_preview_only', False)),
         )
 
     def run(self):
-        """Run the fit. GenericFitRunner writes its own plots and logs."""
+        """Run the fit.
+
+        The runner writes its log, figures and results JSON as it goes; the
+        results also stay on the runner for plot() to turn into the report.
+        """
         self._runner.run()
 
+        results = getattr(self._runner, 'results', None)
+        if results:
+            logging.info(
+                "HPWFitTask: chi2 = %.6f, dof = %d, chi2/dof = %.6f",
+                results['chi2'], results['dof'], results['chi2_per_dof'],
+            )
+        else:
+            logging.warning("HPWFitTask: the run produced no fit results to report.")
+
     def plot(self):
-        """No-op: plotting happens inside run(), driven by the config's plot block."""
-        pass
+        """Assemble the summary document from the figures produced by run()."""
+        if not self.report_enabled:
+            logging.info("HPWFitTask: summary report disabled - skipping.")
+            return
+
+        try:
+            from QC2.report import FitReport
+        except ImportError as exc:
+            logging.warning(f"HPWFitTask: cannot build the summary report: {exc}")
+            return
+
+        plot_dir = self._figure_dir()
+        figures = _collect_figures(plot_dir)
+        results = getattr(self._runner, 'results', None)
+
+        if not figures and not results:
+            logging.warning("HPWFitTask: nothing to report - no figures or results found.")
+            return
+
+        try:
+            report = FitReport(f"Lüscher Fit: {self._runner.study_module_name}")
+        except ImportError as exc:
+            logging.warning(f"HPWFitTask: {exc}")
+            return
+
+        _fill_report(report, results, figures, self._runner.config)
+
+        out_path = report.compile_pdf(os.path.join(plot_dir, 'fit_summary'))
+        if out_path:
+            logging.info(f"HPWFitTask: summary document written to {out_path}")
+
+    def _figure_dir(self):
+        """The per-fit figure subfolder the runner actually wrote into."""
+        plot_dir = self.proj_handler.plot_dir()
+        sub = os.path.join(plot_dir, self._runner.study_module_name)
+        return sub if os.path.isdir(sub) else plot_dir

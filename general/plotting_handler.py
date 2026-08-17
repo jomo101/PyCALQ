@@ -19,7 +19,6 @@ from matplotlib.lines import Line2D  # Import Line2D for custom legend handle
 from scipy.interpolate import interp1d
 from sigmond_scripts import util as utils
 from sigmond_scripts import fit_info
-import luescher.tools.kinematics 
 
 
 #where source and sink labels go on plot

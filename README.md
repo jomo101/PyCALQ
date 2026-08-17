@@ -451,6 +451,26 @@ The task lives in `QC2/`:
 | `QC2/my_fit_model_par.py` | **default engine**: tabulates B(E) once, solves roots vectorized, uses a process pool |
 | `QC2/my_fit_model.py` | reference serial engine; also supplies all plotting/diagnostics to the parallel engine |
 | `QC2/plotting.py` | plot styling and figure helpers |
+| `QC2/report.py` | builds the summary PDF |
+
+#### Outputs
+Everything lands under `<project_dir>/<n>single_channel_fit/`:
+
+| path | contents |
+|---|---|
+| `data/fit_results.json` | χ², dof, χ²/dof, AIC, converged flag, and every parameter with its error and covariance |
+| `logs/hpw_fit_config.json` | the fully-resolved config the run actually used |
+| `logs/hpw_fit_<stamp>.log` | run log |
+| `plots/<channel>/` | spectrum, Lüscher `k·cotδ`, phase-shift and diagnostic figures |
+| `plots/<channel>/fit_summary.pdf` | summary document collecting the tables and figures |
+
+Read `fit_results.json` rather than parsing the log — it is written for exactly that purpose.
+
+Note that in `config_file` mode the output paths inside the JSON are overridden so results stay in
+the project directory; pass `respect_config_paths: true` to keep the JSON's own paths instead.
+`plot: false` skips the figures and the summary document, leaving the results JSON and log (the
+runner still writes its one `fit_results_<channel>.png` results image regardless). `report: false`
+keeps the figures but skips the summary document.
 
 Two usage modes are supported.
 
@@ -527,6 +547,8 @@ Short descriptions of unique task inputs:
 - `n_workers` - (int) worker processes for the parallel engine; `0` disables multiprocessing.
 - `model_file` - (str) engine to use; defaults to `my_fit_model_par.py`.
 - `bmat_preview_only` - (bool) produce only the B-matrix preview plot and skip the fit.
+- `plot` - (bool) produce figures and the summary document. Default `true`.
+- `report` - (bool) produce the summary document. Default `true`; ignored when `plot` is `false`.
 
 ##### Coupled channels
 A coupled block (e.g. ³S₁–³D₁ with a mixing angle ε₁) needs an explicit `quantum_numbers` block:
