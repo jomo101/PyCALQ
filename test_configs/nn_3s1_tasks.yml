@@ -9,10 +9,11 @@
 
 tasks:
   - single_channel_fit:
-      # Point this at your own spectrum file. The lattice data is not shipped
-      # with the repo; omit data_file entirely to auto-discover the most recent
+      # Point this at your own spectrum file — the lattice data is not shipped
+      # with the repo. Omit data_file entirely to auto-discover the most recent
       # HDF5 written by an upstream fit_spectrum task.
-      data_file: /Users/jomoscoso/Desktop/NN-tools/Data/nn_iso_singlet_fullspectrum.h5
+      # Verified against the isosinglet spectrum nn_iso_singlet_fullspectrum.h5.
+      data_file: ./Data/nn_iso_singlet_fullspectrum.h5
       lattice_size: 48
       continuum: true
       cutoff: 10

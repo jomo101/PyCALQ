@@ -2,7 +2,7 @@
   "study_module": "N_N_3S1",
   "model_file": "QC2/my_fit_model_par.py",
   "input": {
-    "file": "/Users/jomoscoso/Desktop/NN-tools/Data/nn_iso_singlet_fullspectrum.h5",
+    "file": "./Data/nn_iso_singlet_fullspectrum.h5",
     "lattice_size": 48,
     "continuum": true,
     "cutoff": 10.0
@@ -70,28 +70,19 @@
   },
   "plot": {
     "enabled": true,
-    "save_path": "/tmp/pycalq_nn_3s1/6single_channel_fit/plots/hpw_fit_spectrum.pdf",
     "save_timestamp": true,
     "com_frame": true,
     "show": false,
     "ylabel": "$E^\\star / m_N$",
     "show_ni": true,
     "show_level_labels": true,
-    "figures_dir": "/tmp/pycalq_nn_3s1/6single_channel_fit/plots",
     "bmatrix_preview": {
       "enabled": false,
-      "save_path": "/tmp/pycalq_nn_3s1/6single_channel_fit/plots/bmatrix_preview.pdf",
       "n_sweep": 800,
       "clip": 30.0,
       "y_scale_mode": "data_central",
       "show": false
     }
-  },
-  "logging": {
-    "enabled": true,
-    "dir": "/tmp/pycalq_nn_3s1/6single_channel_fit/logs",
-    "prefix": "hpw_fit",
-    "level": "INFO"
   },
   "data": [
     {
