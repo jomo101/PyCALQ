@@ -1,0 +1,13 @@
+# Mode 2: drive the fit from a pre-made GenericFitRunner JSON config.
+#
+# nn_3s1_fit.json evaluates the quantization condition at the published 3S1
+# best-fit parameters (skip_minimization: true), so it finishes quickly and
+# should reproduce chi2 = 28.648069 without re-running the minimizer.
+#
+#   MPLBACKEND=Agg BMAT_PATH=/path/to/pythib \
+#     python run.py -g test_configs/nn_3s1_general.yml \
+#                   -t test_configs/nn_3s1_mode2_tasks.yml
+
+tasks:
+  - single_channel_fit:
+      config_file: test_configs/nn_3s1_fit.json

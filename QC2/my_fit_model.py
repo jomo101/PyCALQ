@@ -1,4 +1,6 @@
+import copy
 import logging
+import os
 import numpy as np
 from scipy.optimize import fsolve
 from scipy.optimize import minimize
@@ -7,10 +9,27 @@ import gvar as gv
 import itertools
 import plotting as pt
 
-pt.apply_plot_style(use_tex=True)
+# Skip TeX plot styling inside fit worker processes: matplotlib's LaTeX
+# probing (kpsewhich) is slow and can deadlock when many workers race on it.
+if os.environ.get("HPW_FIT_WORKER") != "1":
+    pt.apply_plot_style(use_tex=True)
+
+# ── BMat (TwoHadronsInBox python bindings) ───────────────────────────────────
+# Built manually from https://github.com/ebatz/pythib, so it is usually not on
+# the default import path. Resolution order:
+#   1. $BMAT_PATH (or $PYTHIB_PATH) - directory holding the built BMat*.so
+#   2. a plain `import BMat` - covers PYTHONPATH / site-packages installs
+# A missing BMat is not fatal at import time: the config-preview and plotting
+# paths stay usable, and only the code that actually solves the quantization
+# condition raises, with _BMAT_IMPORT_ERROR explaining why.
+for _bmat_env in ("BMAT_PATH", "PYTHIB_PATH"):
+    _bmat_dir = os.environ.get(_bmat_env)
+    if _bmat_dir:
+        _bmat_dir = os.path.expanduser(_bmat_dir)
+        if _bmat_dir not in sys.path:
+            sys.path.append(_bmat_dir)
 
 try:
-    sys.path.append('/Users/jomoscoso/Desktop/Analysis_codes/pythib_jo')
     import BMat
 except Exception as exc:
     BMat = None
@@ -100,6 +119,12 @@ def _normalize_qn_channels():
     cursor = 0
     for idx, qn_channel in enumerate(channels):
         item = dict(qn_channel)
+        # legacy configs write JtimesTwo/StimesTwo/SptimesTwo — alias them to
+        # the twoJ/twoS/twoSp keys the labels and wave-colour keying read
+        for new, old in (("twoJ", "JtimesTwo"), ("twoS", "StimesTwo"),
+                         ("twoSp", "SptimesTwo")):
+            if new not in item and old in item:
+                item[new] = int(item[old])
         enabled = bool(item.get("enabled", True))
         k_matrix_raw = item.get("k_matrix", "polynomial")
         # k_matrix can be a string (uncoupled) or a list (coupled: one mode per param group)
@@ -436,12 +461,9 @@ def _k_matrix_ere(coeffs, p2):
     return float((-1.0 / a0) + 0.5 * r0 * p2)
 
 def _k_matrix_poly_s(coeffs, Ecm_over_mref):
-    A = float(coeffs[0]) if len(coeffs) > 0 else 0.0
-    B = float(coeffs[1]) if len(coeffs) > 1 else 0.0
-    C = float(coeffs[2]) if len(coeffs) > 2 else 0.0 
-    ecm = float(Ecm_over_mref)
-    ere1_val = A + ecm**2 * B + (ecm**2)** 2 * C
-    return float(ere1_val)
+    # Polynomial in s = Ecm^2 of arbitrary order: c0 + c1*s + c2*s^2 + ...
+    s = float(Ecm_over_mref) ** 2
+    return float(sum(float(c) * s ** i for i, c in enumerate(coeffs)))
 
 def _k_matrix_ere1_vs(coeffs, Ecm_over_mref, MN, MK):
     _ = (MN, MK)
@@ -453,10 +475,18 @@ def _k_matrix_ere1_vs(coeffs, Ecm_over_mref, MN, MK):
     return float(ere1_val)
 
 def _k_matrix_epsilon(coeffs, p2):
+    """Mixing angle as an odd polynomial in p2: theta = c0*p2 + c1*p2^2 + ...
+
+    A single coefficient reproduces the linear form theta = eps0*p2 exactly;
+    extra coefficients add p^4, p^6, ... terms (used for the mixing-angle
+    energy-dependence systematic).  Mirrored in my_fit_model_par._kvec_eval.
+    """
     if len(coeffs) < 1:
         raise ValueError("k_matrix='epsilon' requires at least 1 parameter: [epsilon0].")
-    epsilon0 = float(coeffs[0])
-    return float(epsilon0 * p2)
+    theta = 0.0
+    for i, ci in enumerate(coeffs):
+        theta += float(ci) * p2 ** (i + 1)
+    return float(theta)
 
 def _k_matrix_coupled(coeffs, L, Lp, p2, Ecm_over_mref, MN, MK,
                          param_groups=None, k_matrix_modes=None, L_values=None):
@@ -528,12 +558,18 @@ def _k_matrix_coupled(coeffs, L, Lp, p2, Ecm_over_mref, MN, MK,
 
     L_int, Lp_int = int(L), int(Lp)
     half_delta = delta / 2.0
-    if L_int == La and Lp_int == La:          # "aa" diagonal
-        return kcot_a * ct ** 2 + kcot_b * st ** 2 / p2 ** (2)#* p2 ** (-delta)
-    elif L_int == Lb and Lp_int == Lb:        # "bb" diagonal
-        return kcot_b * ct ** 2 + kcot_a * st ** 2 * p2 ** 2#delta
-    elif {L_int, Lp_int} == {La, Lb}:         # off-diagonal
-        return ct * st * (kcot_a * p2  - kcot_b / p2 )#ct * st * (kcot_a * p2 ** half_delta - kcot_b * p2 ** (-half_delta))
+    if L_int == La and Lp_int == La:
+        return kcot_a * ct**2 + kcot_b * st**2 / p2**2            # remove / p2**(2)
+    elif L_int == Lb and Lp_int == Lb:
+        return kcot_b * ct**2 + kcot_a * st**2 * p2**2            # remove * p2**2
+    elif {L_int, Lp_int} == {La, Lb}:
+        return ct * st * (p2*kcot_a - kcot_b/p2)                # remove p2 factors
+    # if L_int == La and Lp_int == La:          # "aa" diagonal
+    #     return kcot_a * ct ** 2 + kcot_b * st ** 2 / p2 ** (2)#* p2 ** (-delta)
+    # elif L_int == Lb and Lp_int == Lb:        # "bb" diagonal
+    #     return kcot_b * ct ** 2 + kcot_a * st ** 2 * p2 ** 2#delta
+    # elif {L_int, Lp_int} == {La, Lb}:         # off-diagonal
+    #     return ct * st * (kcot_a * p2  - kcot_b / p2 )#ct * st * (kcot_a * p2 ** half_delta - kcot_b * p2 ** (-half_delta))
     else:
         return 0.0
 
@@ -584,8 +620,12 @@ def _evaluate_k_matrix(mode, coeffs, p2, Ecm_over_mref=None, MN=None, MK=None,
 def _require_bmat():
     if BMat is None:
         raise ImportError(
-            f"BMat import failed: {_BMAT_IMPORT_ERROR}. "
-            "Ensure BMat is installed and importable in this Python environment."
+            f"BMat import failed: {_BMAT_IMPORT_ERROR}.\n"
+            "QC2 needs the TwoHadronsInBox python bindings (pythib). Build them "
+            "from https://github.com/ebatz/pythib, then point QC2 at the build "
+            "directory:\n"
+            "    export BMAT_PATH=/path/to/pythib\n"
+            "or place the built BMat*.so anywhere on PYTHONPATH."
         )
 
 
@@ -619,6 +659,18 @@ _L_STEP_DIV   = {0: 8.0, 1: 80.0, 2: 800.0, 3: 2400.0, 4: 4000.0}
 # ── tracks which (psq, max_L) combos have already had their grid step printed ─
 _GRID_PRINTED = set()
 
+# ── warm-start root cache ─────────────────────────────────────────────────────
+# Maps (psq, irrep) -> list of roots from the previous successful scan.
+# The optimizer moves params by a small delta each step, so roots barely move.
+# On a cache hit we try brentq in [root ± delta] first — ~10 BMat calls vs
+# hundreds for a full grid scan.  Falls back to full scan if bracket fails.
+_WARM_ROOT_CACHE: dict = {}
+
+
+def clear_warm_root_cache():
+    """Call between unrelated fits to avoid stale roots."""
+    _WARM_ROOT_CACHE.clear()
+
 
 def _initial_guesses_for_psq(psq, irrep, nsols, epsaux, data_ecm=None,
                              max_L=0, step_mode='adaptive', n_refine=1):
@@ -647,8 +699,8 @@ def _initial_guesses_for_psq(psq, irrep, nsols, epsaux, data_ecm=None,
     psq   = int(psq)
     max_L = int(max_L)
 
-    if step_mode == 'uniform':
-        eff_eps = epsaux          # n_refine is already in epsaux
+    if step_mode in ('uniform', 'wave_adaptive'):
+        eff_eps = epsaux          # n_refine is already in epsaux; wave_adaptive manages its own grid
     else:  # 'adaptive'
         psq_div = _PSQ_STEP_DIV.get(psq, 1.0)
         l_div   = _L_STEP_DIV.get(max_L, float(max_L) * 3.0 if max_L > 4 else 1.0)
@@ -689,7 +741,8 @@ def _calculate_noninteracting_energies(self, mom_vectors, lattice_size, massN):
     
 def _findspectrum_irrep(epsaux, nsols, mom, mL, par, irrep, MN, MK,
                         data_ecm=None, debug=True, energy_aware=False,
-                        step_mode='adaptive', n_refine=1, mN_err=None):
+                        step_mode='adaptive', n_refine=1, mN_err=None,
+                        fit_mode='omega'):
     from scipy.optimize import brentq
 
     _require_bmat()
@@ -719,12 +772,71 @@ def _findspectrum_irrep(epsaux, nsols, mom, mL, par, irrep, MN, MK,
     box_q.setRefMassL(mL)
     box_q.setMassesOverRef(0, MN, MK)
 
-    _MU = -1.0
-    def faux(e):
-        try:
-            return float(box_q.getOmegaFromEcm(_MU, float(e)))
-        except Exception:
-            return np.nan
+    # ── objective function: omega (default) or smallest-|λ| eigenvalue ────────
+    # fit_mode='omega'      : det(B−K⁻¹) via getOmegaFromEcm — original behaviour
+    # fit_mode='eigenvalue' : signed eigenvalue of Omega with smallest |λ| via
+    #                         getEigenvaluesFromEcm, regularised as λ/√(μ²+λ²)
+    #                         so NI-pole blow-ups saturate to ±1 instead of
+    #                         diverging, preventing false sign changes.
+    if fit_mode == 'eigenvalue':
+        # Adaptive μ: sample |λ_min| away from threshold to set regularisation width
+        _sample = []
+        for _e in np.linspace(2.001, 2.35, 20):
+            try:
+                eigs = box_q.getEigenvaluesFromEcm(float(_e))
+                v = abs(min(eigs, key=abs))
+                if np.isfinite(v) and v > 0:
+                    _sample.append(v)
+            except Exception:
+                pass
+        _mu = max(1e-3, float(np.nanmedian(_sample)) * 0.1) if _sample else 0.1
+
+        def faux(e):
+            try:
+                eigs = box_q.getEigenvaluesFromEcm(float(e))
+                lam  = float(min(eigs, key=abs))
+                return lam / np.sqrt(_mu ** 2 + lam ** 2)
+            except Exception:
+                return np.nan
+    else:
+        _MU = -1.0
+        def faux(e):
+            try:
+                return float(box_q.getOmegaFromEcm(_MU, float(e)))
+            except Exception:
+                return np.nan
+
+    # ── warm-start: try brentq near cached roots before doing a full scan ────
+    _cache_key = (psq, irrep)
+    _cached    = _WARM_ROOT_CACHE.get(_cache_key, [])
+    if _cached and len(_cached) >= nsols and not debug:
+        _delta     = max(50 * epsaux, 5e-5)
+        _ni_wide_q = _generate_ni_levels(mL, mom, max(c + 0.1 for c in _cached))
+        _ni_q      = np.asarray(_ni_wide_q, dtype=float)
+        _ni_buf_q  = max(2 * epsaux, 1e-6)
+        _warm_sols = []
+        _all_hit   = True
+        for _prev in _cached[:nsols]:
+            _lo = max(_prev - _delta, 2.0 + 1e-4)
+            _hi = _prev + _delta
+            # clamp to NI walls
+            _walls_lo = _ni_q[_ni_q < _prev]
+            _walls_hi = _ni_q[_ni_q > _prev]
+            if len(_walls_lo): _lo = max(_lo, float(_walls_lo[-1]) + _ni_buf_q)
+            if len(_walls_hi): _hi = min(_hi, float(_walls_hi[0])  - _ni_buf_q)
+            if _lo >= _hi: _all_hit = False; break
+            _fa, _fb = faux(_lo), faux(_hi)
+            if not (np.isfinite(_fa) and np.isfinite(_fb) and _fa * _fb < 0):
+                _all_hit = False; break
+            try:
+                _root = brentq(faux, _lo, _hi, xtol=1e-12, rtol=1e-12, maxiter=200)
+                _warm_sols.append(_root)
+            except Exception:
+                _all_hit = False; break
+        if _all_hit and len(_warm_sols) == nsols:
+            _WARM_ROOT_CACHE[_cache_key] = _warm_sols
+            return _warm_sols
+    # ─────────────────────────────────────────────────────────────────────────
 
     # ── data levels ───────────────────────────────────────────────────────────
     if data_ecm is not None and len(data_ecm) > 0:
@@ -746,43 +858,48 @@ def _findspectrum_irrep(epsaux, nsols, mom, mL, par, irrep, MN, MK,
     ni_levels_wide = _generate_ni_levels(mL, mom, float(d_sorted[-1]) + 0.3 if len(d_sorted) else 2.5)
     ni_arr_wide    = np.asarray(ni_levels_wide, dtype=float)
 
-    # ── NI buffer: physical distance to keep away from NI walls ──────────────
-    # fast + mN_err  → physical buffer from NI sensitivity to mN uncertainty
-    # uniform        → 5*epsaux  (original, known-good)
-    # adaptive/fast  → 5*eff_epsaux, shrinks as n_refine increases, capped at
-    #                  min_ni_gap/4 for finely-spaced NI pairs
+    # ── Data-driven NI buffer and fine-zone ──────────────────────────────────
+    # Compute the minimum distance from any data level to any NI wall.
+    # This is the physically meaningful scale: we know QC roots sit at least
+    # this close to NI walls (since the data levels are there), so there's no
+    # point keeping a buffer larger than this.
+    #
+    # ni_buffer  = min_data_to_ni / 2  — search right up to where data sits
+    # fine_zone  = min_data_to_ni * 1.5 — finer grid within this distance of
+    #              each NI wall; coarser in the middle (see uniform path below)
+    #
+    # Fallback for fast/mN_err mode: retain the physical mN-uncertainty buffer.
+    if len(d_sorted) > 0 and len(ni_arr_wide) > 0:
+        _all_dists = np.abs(d_sorted[:, None] - ni_arr_wide[None, :]).ravel()
+        _min_d2ni  = float(np.min(_all_dists))
+        # Buffer: half the observed minimum gap, but never so small that we sit
+        # on the divergence (floor at 2*epsaux or 1e-6, whichever is larger).
+        _data_buffer = max(_min_d2ni * 0.5, 2 * epsaux, 1e-6)
+        # Fine-grid zone around each NI wall: 1.5× the minimum observed gap.
+        fine_zone = max(_min_d2ni * 1.5, 5 * eff_epsaux)
+    else:
+        _min_d2ni    = 5 * epsaux   # fallback when no data or no NI levels
+        _data_buffer = max(2 * epsaux, 1e-6)
+        fine_zone    = 5 * eff_epsaux
+
     if step_mode == 'fast' and mN_err is not None and float(mN_err) > 0:
-        # Fast mode only: use physically-motivated buffer from mN uncertainty.
-        # mL = mN*L, so δmL/mL = δmN/MN; compute NI levels at mL±δmL and
-        # take the largest resulting NI level shift.
         _frac     = float(mN_err) / float(MN)
         _ecm_ceil = (float(d_sorted[-1]) + 0.5) if len(d_sorted) else 3.0
         _ni_p     = np.asarray(_generate_ni_levels(mL * (1.0 + _frac), mom, _ecm_ceil))
         _ni_m     = np.asarray(_generate_ni_levels(mL * (1.0 - _frac), mom, _ecm_ceil))
         _shifts   = []
         for _i, _en in enumerate(ni_arr_wide):
-            if _i < len(_ni_p):
-                _shifts.append(abs(float(_ni_p[_i]) - float(_en)))
-            if _i < len(_ni_m):
-                _shifts.append(abs(float(_ni_m[_i]) - float(_en)))
+            if _i < len(_ni_p): _shifts.append(abs(float(_ni_p[_i]) - float(_en)))
+            if _i < len(_ni_m): _shifts.append(abs(float(_ni_m[_i]) - float(_en)))
         _ni_buffer_phys = (max(_shifts) if _shifts else 5 * eff_epsaux) / 10.0
         if len(ni_arr_wide) >= 2:
             _min_ni_gap = float(np.min(np.diff(ni_arr_wide)))
             ni_buffer   = min(_ni_buffer_phys, _min_ni_gap / 4.0)
         else:
             ni_buffer   = _ni_buffer_phys
-        ni_buffer = max(ni_buffer, 1e-6)   # floor: must not evaluate on the pole
-    elif step_mode == 'uniform':
-        ni_buffer = 5 * epsaux
+        ni_buffer = max(ni_buffer, 1e-6)
     else:
-        # adaptive (and fast without mN_err): scale with eff_epsaux so the
-        # buffer shrinks as n_refine increases, capped at min_ni_gap/4.
-        _base_buffer = 5 * eff_epsaux
-        if len(ni_arr_wide) >= 2:
-            _min_ni_gap = float(np.min(np.diff(ni_arr_wide)))
-            ni_buffer   = _base_buffer#min(_base_buffer, _min_ni_gap / 4.0)
-        else:
-            ni_buffer = _base_buffer
+        ni_buffer = _data_buffer
 
     _grid_key = (psq, max_L_channels)
     if _grid_key not in _GRID_PRINTED:
@@ -863,11 +980,14 @@ def _findspectrum_irrep(epsaux, nsols, mom, mL, par, irrep, MN, MK,
         if debug:
             _progress_log(f"  [fast] omega_scale={_omega_scale:.3e}  residual_tol={_residual_tol:.3e}")
     else:
+        # 20-point survey matches fast mode — 300 was wasteful since the scale
+        # estimate only needs a rough median, not high coverage.
         _sample_pts = []
-        if len(ni_arr) > 0:
-            for _e in np.linspace(ecm_lo, ecm_hi, 300):
-                if np.all(np.abs(_e - ni_arr) > ni_buffer):
-                    _sample_pts.append(abs(faux(_e)))
+        for _e in np.linspace(ecm_lo, ecm_hi, 20):
+            if len(ni_arr) == 0 or np.all(np.abs(_e - ni_arr) > ni_buffer):
+                _v = abs(faux(_e))
+                if np.isfinite(_v) and _v > 0:
+                    _sample_pts.append(_v)
         _omega_scale  = float(np.nanmedian(_sample_pts)) if _sample_pts else 1e-4
         _residual_tol = 1e-3 * _omega_scale + 1e-11
 
@@ -879,12 +999,51 @@ def _findspectrum_irrep(epsaux, nsols, mom, mL, par, irrep, MN, MK,
     solutions     = []
     used_brackets = set()
 
-    if step_mode == 'uniform':
-        # ── UNIFORM path: single-pass np.arange scan (original, known-good) ───
+    # ── wave_adaptive grid builder ────────────────────────────────────────────
+    # Fine near each NI wall (L-scaled zone), coarse in the middle.
+    #
+    # fine_width  = min_data_to_ni × (0.5 + max_L)
+    #   L=0 → 0.5 × min_d2ni  (small: S-wave roots don't sit right at the wall)
+    #   L=2 → 2.5 × min_d2ni  (large: D-wave roots can sit very close to pole)
+    #
+    # coarse_step = min(4 × epsaux, min_data_spacing / 4)
+    #   Tied to the actual data spacing so S-wave roots in the middle are
+    #   never more than 4 steps apart — the coarse scan can't miss them.
+    if step_mode == 'wave_adaptive':
+        _fine_width = _min_d2ni * (0.5 + max_L_channels)
+        if len(d_sorted) > 1:
+            _min_spacing = float(np.min(np.diff(d_sorted)))
+        else:
+            _min_spacing = float(ecm_hi - ecm_lo) if ecm_hi > ecm_lo else 4 * epsaux * 10
+        _coarse_step = min(4 * epsaux, _min_spacing / 4.0)
+        _coarse_step = max(_coarse_step, epsaux)   # never coarser than epsaux itself
+
+        def _wave_adaptive_grid(lo, hi):
+            pts = []
+            e   = lo
+            while e <= hi + epsaux * 0.5:
+                pts.append(min(e, hi))
+                if (e - lo) < _fine_width or (hi - e) < _fine_width:
+                    e += epsaux          # fine near each NI wall
+                else:
+                    e += _coarse_step   # coarse in the middle
+            return np.array(pts)
+
+        if _grid_key not in _GRID_PRINTED:
+            _GRID_PRINTED.add(_grid_key)
+            print(f"  [grid] PSQ={psq}  max_L={max_L_channels}  mode='wave_adaptive'  "
+                  f"epsaux={epsaux:.3e}  fine_width={_fine_width:.3e}  "
+                  f"coarse_step={_coarse_step:.3e}  ni_buffer={ni_buffer:.3e}")
+
+    if step_mode in ('uniform', 'wave_adaptive'):
+        # ── UNIFORM / WAVE_ADAPTIVE path ──────────────────────────────────────
         for i_lev, e_data in enumerate(d_sorted[:nsols]):
             grid_lo, grid_hi = _window(i_lev, e_data)
 
-            e_arr  = np.arange(grid_lo, grid_hi + eff_epsaux * 0.5, eff_epsaux)
+            if step_mode == 'wave_adaptive':
+                e_arr = _wave_adaptive_grid(grid_lo, grid_hi)
+            else:
+                e_arr = np.arange(grid_lo, grid_hi + eff_epsaux * 0.5, eff_epsaux)
             omegas = np.array([faux(e) for e in e_arr])
 
             if debug:
@@ -938,21 +1097,11 @@ def _findspectrum_irrep(epsaux, nsols, mom, mL, par, irrep, MN, MK,
                 if key in used_brackets:
                     continue
 
-                e_fine = np.linspace(ea, eb, 200)
-                f_fine = np.array([faux(e) for e in e_fine])
-
-                tight_a = tight_b = None
-                for k in range(len(e_fine) - 1):
-                    if (np.isfinite(f_fine[k]) and np.isfinite(f_fine[k+1])
-                            and f_fine[k] * f_fine[k+1] < 0.0):
-                        tight_a, tight_b = e_fine[k], e_fine[k+1]
-                        break
-
-                if tight_a is None:
-                    continue
-
+                # brentq converges to xtol=1e-12 directly from the coarse bracket —
+                # the 200-point re-scan was redundant since brentq already bisects
+                # to any required precision internally.
                 try:
-                    e_root = brentq(faux, tight_a, tight_b,
+                    e_root = brentq(faux, ea, eb,
                                     xtol=1e-12, rtol=1e-12, maxiter=500)
                     f_root = abs(faux(e_root))
 
@@ -1276,7 +1425,7 @@ def _findspectrum_irrep(epsaux, nsols, mom, mL, par, irrep, MN, MK,
     # ── finalise ──────────────────────────────────────────────────────────────
     solutions = sorted(solutions)
     merged    = []
-    final_merge_tol = 3 * epsaux if step_mode == 'uniform' else ni_buffer
+    final_merge_tol = 3 * epsaux if step_mode in ('uniform', 'wave_adaptive') else ni_buffer
     for z in solutions:
         if merged and abs(z - merged[-1]) < final_merge_tol:
             merged[-1] = 0.5 * (merged[-1] + z)
@@ -1534,6 +1683,8 @@ def _findspectrum_sweep(epsaux, nsols, mom, mL, par, irrep, MN, MK,
     if debug:
         _progress_log(f"\n  [result] {len(solutions)}/{nsols}  {[f'{z:.7f}' for z in solutions]}")
 
+    if solutions:
+        _WARM_ROOT_CACHE[_cache_key] = list(solutions[:nsols])
     return solutions[:nsols]
 
 def _findspectrum_simple(epsaux, nsols, mom, mL, par, irrep, MN, MK,
@@ -1728,6 +1879,8 @@ def _findspectrum_simple(epsaux, nsols, mom, mL, par, irrep, MN, MK,
             f"{[f'{z:.7f}' for z in solutions]}"
         )
 
+    if solutions:
+        _WARM_ROOT_CACHE[_cache_key] = list(solutions[:nsols])
     return solutions[:nsols]
 
 
@@ -1941,6 +2094,8 @@ def _findspectrum_lambda(epsaux, nsols, mom, mL, par, irrep, MN, MK,
             f"{[f'{z:.7f}' for z in solutions]}"
         )
 
+    if solutions:
+        _WARM_ROOT_CACHE[_cache_key] = list(solutions[:nsols])
     return solutions[:nsols]
 
 
@@ -1997,7 +2152,8 @@ def calcFunc_param(J, Lp, Sp, chanp, L, S, chan, Ecm_over_mref, pSqFuncList, MN,
                                   L=L, Lp=Lp, param_groups=pg,
                                   k_matrix_modes=km, L_values=lv)
     if L == Lp and L in (0, 1, 2, 3):
-        return _evaluate_k_matrix(k_matrix_mode, coeffs, p2, Ecm_over_mref=Ecm_over_mref, MN=MN, MK=MK) #p2**int(L) * _evaluate_k_matrix(k_matrix_mode, coeffs, p2, Ecm_over_mref=Ecm_over_mref, MN=MN, MK=MK)
+        return _evaluate_k_matrix(k_matrix_mode, coeffs, p2, Ecm_over_mref=Ecm_over_mref, MN=MN, MK=MK)
+    return 0.0
        
 
 
@@ -2012,7 +2168,8 @@ def _expand_structure(frames, irreps, levels):
 
 def _model_datap2(par, frames, irreps, levels, mL, MN, MK, n=400,
                   debug=False, data2cm=None, kept_mom2=None, kept_irreps=None,
-                  step_mode='adaptive', n_refine=1, mN_err=None):
+                  step_mode='adaptive', n_refine=1, mN_err=None, fit_mode='omega',
+                  observable='shift', ni_sum=None):
     # ── pre-build data-Ecm lookup (avoids O(N) scan per (frame,irrep) per chi2 call) ──
     _ecm_lookup = None
     if data2cm is not None and kept_mom2 is not None and kept_irreps is not None:
@@ -2044,29 +2201,86 @@ def _model_datap2(par, frames, irreps, levels, mL, MN, MK, n=400,
                     step_mode=step_mode,
                     n_refine=n_refine,
                     mN_err=mN_err,
+                    fit_mode=fit_mode,
                 )
             )
 
-    epred = np.asarray(epred, dtype=float)
-    return epred**2 / 4.0 - 1.0
+    epred = np.asarray(epred, dtype=float)  # E_cm / mN solutions
+
+    # Convert to requested observable
+    if observable == 'p2':
+        return epred**2 / 4.0 - 1.0
+    elif observable == 'ecm':
+        return epred                          # already E_cm/mN (dimensionless)
+    elif observable == 'elab':
+        # True lab energy: E_lab/mN = sqrt((E_cm/mN)^2 + (P/mN)^2); the
+        # per-level lab boost (P/mN)^2 rides in ni_sum (same convention as
+        # the par engine — set by the runner for fit_observable='elab').
+        if ni_sum is None:
+            raise ValueError("observable='elab' requires (P/mN)^2 per level via ni_sum")
+        return np.sqrt(epred**2 + np.asarray(ni_sum, dtype=float))
+    elif observable == 'shift':
+        if ni_sum is None:
+            raise ValueError("observable='shift' requires ni_sum (E_N1+E_N2 per level)")
+        _ni = np.asarray(ni_sum, dtype=float)
+        if _ni.ndim == 2:
+            # rows: [ni_sum_lab/mN, (P/mN)^2] — lab-frame shift with the
+            # cm->lab boost (same convention as the par engine):
+            # shift/mN = sqrt(ecm^2 + (P/mN)^2) - ni_lab/mN.
+            return np.sqrt(epred**2 + _ni[1]) - _ni[0]
+        # legacy rest-frame-only formula: epred*MN - ni_sum
+        return epred * MN - _ni
+    else:
+        raise ValueError(f"Unknown observable '{observable}'. Use: p2 | ecm | elab | shift")
 
 
 
 def _chi2(par, data, frames, irreps, levels, mL, cov, MN, MK, n=400,
           data2cm=None, kept_mom2=None, kept_irreps=None,
-          step_mode='adaptive', n_refine=1, mN_err=None):
+          step_mode='adaptive', n_refine=1, mN_err=None, fit_mode='omega',
+          observable='shift', ni_sum=None):
     try:
         model = _model_datap2(par, frames, irreps, levels, mL, MN, MK, n=n,
                               data2cm=data2cm, kept_mom2=kept_mom2, kept_irreps=kept_irreps,
-                              step_mode=step_mode, n_refine=n_refine, mN_err=mN_err)
+                              step_mode=step_mode, n_refine=n_refine, mN_err=mN_err,
+                              fit_mode=fit_mode, observable=observable, ni_sum=ni_sum)
     except Exception:
         return 1e12
 
     data_arr  = np.asarray(data,  dtype=float)
     model_arr = np.asarray(model, dtype=float)
-    # data_Ecm = 2*np.sqrt( data_arr + 1.0)  # convert back to Ecm/mN for mismatch handling
-    # model_Ecm = 2*np.sqrt( model_arr + 1.0)  # convert back to Ecm/mN for mismatch handling
     cov_arr   = np.asarray(cov,   dtype=float)
+
+    # ── duplicate root penalty ────────────────────────────────────────────────
+    # If two model predictions are within dup_tol of each other (in p² units),
+    # the root-finder assigned the same QC root to two different levels.
+    # Add a heavy penalty proportional to how many duplicates exist so the
+    # optimizer moves away from this degenerate region.
+    # dup_tol = 1e-5 in p²  ≈  5e-6 in Ecm/mN — tight enough to only flag
+    # true duplicates (same root), loose enough to allow legitimate near-
+    # degenerate levels that are physically distinct.
+    if model_arr.shape == data_arr.shape and len(model_arr) > 1:
+        _dup_tol = 1e-5
+        _finite  = model_arr[np.isfinite(model_arr)]
+        if len(_finite) > 1:
+            _diffs = np.abs(_finite[:, None] - _finite[None, :])
+            np.fill_diagonal(_diffs, np.inf)
+            _n_dups = int(np.sum(_diffs < _dup_tol) // 2)
+            if _n_dups > 0:
+                _penalty = 1e5 * _n_dups
+                # Still include residuals from non-duplicate levels for gradient
+                _valid = np.ones(len(model_arr), dtype=bool)
+                for _i in range(len(model_arr)):
+                    for _j in range(_i+1, len(model_arr)):
+                        if (np.isfinite(model_arr[_i]) and np.isfinite(model_arr[_j])
+                                and abs(model_arr[_i] - model_arr[_j]) < _dup_tol):
+                            _valid[_j] = False  # mark the later duplicate as bad
+                _n_use = int(_valid.sum())
+                if _n_use > 0:
+                    _resid   = (data_arr - model_arr)[_valid]
+                    _sub_inv = np.linalg.inv(cov_arr[np.ix_(_valid, _valid)])
+                    return float(_resid @ _sub_inv @ _resid) + _penalty
+                return float(_penalty)
 
     # ── handle count mismatch gracefully ──────────────────────────────────────
     if model_arr.shape != data_arr.shape:
@@ -2089,7 +2303,8 @@ def minimizechi2(data, frames, irreps, levels, mL, cov, p0, MN, MK,
                  n_starts=20, param_bounds=None,
                  data2cm=None, kept_mom2=None, kept_irreps=None,
                  step_mode='adaptive', n_refine=1,
-                 xatol=1e-6, fatol=1e-6, mN_err=None):
+                 xatol=1e-6, fatol=1e-6, mN_err=None, fit_mode='omega',
+                 observable='shift', ni_sum=None):
 
     from scipy.optimize import differential_evolution
 
@@ -2108,7 +2323,8 @@ def minimizechi2(data, frames, irreps, levels, mL, cov, p0, MN, MK,
     def _model(params):
         return _model_datap2(params, frames, irreps, levels, mL, MN, MK, n=n,
                              data2cm=data2cm, kept_mom2=kept_mom2, kept_irreps=kept_irreps,
-                             step_mode=step_mode, n_refine=n_refine, mN_err=mN_err)
+                             step_mode=step_mode, n_refine=n_refine, mN_err=mN_err,
+                             fit_mode=fit_mode, observable=observable, ni_sum=ni_sum)
 
     _cov_arr = np.asarray(cov, dtype=float)
 
@@ -2120,7 +2336,8 @@ def minimizechi2(data, frames, irreps, levels, mL, cov, p0, MN, MK,
             model_arr = np.asarray(
                 _model_datap2(params, frames, irreps, levels, mL, MN, MK, n=n,
                               data2cm=data2cm, kept_mom2=kept_mom2, kept_irreps=kept_irreps,
-                              step_mode=step_mode, n_refine=n_refine, mN_err=mN_err),
+                              step_mode=step_mode, n_refine=n_refine, mN_err=mN_err,
+                              fit_mode=fit_mode, observable=observable, ni_sum=ni_sum),
                 dtype=float,
             )
             if model_arr.shape != data_arr.shape:
@@ -2197,9 +2414,14 @@ def minimizechi2(data, frames, irreps, levels, mL, cov, p0, MN, MK,
             _progress_log(f"WARNING: Initial chi2 evaluation failed: {e}")
             _progress_log("Continuing with minimization anyway...")
 
-        _progress_log("minimization started [nelder-mead]")
+        _nm_bounds = [tuple(b) for b in param_bounds] if param_bounds else None
+        _progress_log(
+            f"minimization started [nelder-mead]"
+            + (f"  bounds={_nm_bounds}" if _nm_bounds else "  (no bounds)")
+        )
         try:
             result    = minimize(objective, p0, method="Nelder-Mead",
+                                 bounds=_nm_bounds,
                                  callback=callback,
                                  options={"maxiter": n_maxiter, "xatol": xatol, "fatol": fatol})
             best_x    = result.x
@@ -2208,6 +2430,7 @@ def minimizechi2(data, frames, irreps, levels, mL, cov, p0, MN, MK,
         except _EarlyStop:
             converged = False
             result    = minimize(objective, p0, method="Nelder-Mead",
+                                 bounds=_nm_bounds,
                                  options={"maxiter": iter_count, "xatol": 1e-6, "fatol": 1e-6})
             best_x    = result.x
             best_chi2 = float(result.fun)
@@ -2285,7 +2508,8 @@ def minimizechi2(data, frames, irreps, levels, mL, cov, p0, MN, MK,
 
 def vij(par, dataE2, frames, irreps, levels, mL, cov, MN, MK, n=150, epsilon=1e-5,
         data2cm=None, kept_mom2=None, kept_irreps=None,
-        step_mode='adaptive', n_refine=1, mN_err=None):
+        step_mode='adaptive', n_refine=1, mN_err=None, fit_mode='omega',
+        observable='shift', ni_sum=None):
 
     par    = np.asarray(par,    dtype=float)
     data   = np.asarray(dataE2, dtype=float)
@@ -2296,8 +2520,10 @@ def vij(par, dataE2, frames, irreps, levels, mL, cov, MN, MK, n=150, epsilon=1e-
         return np.asarray(
             _model_datap2(params, frames, irreps, levels, mL, MN, MK, n=n,
                           data2cm=data2cm, kept_mom2=kept_mom2, kept_irreps=kept_irreps,
-                          step_mode=step_mode, n_refine=n_refine, mN_err=mN_err),
+                          step_mode=step_mode, n_refine=n_refine, mN_err=mN_err,
+                          fit_mode=fit_mode, observable=observable, ni_sum=ni_sum),
             dtype=float
+
         )
 
     cov_inv         = np.linalg.inv(np.asarray(cov, dtype=float))
@@ -2390,6 +2616,644 @@ def build_energy_cm_dict(data2cm, mom2, irreps, levels):
         energy_dict.setdefault(psq_label, {}).setdefault(irrep, {})[int(level_idx)] = list(energies)
     return energy_dict
 
+
+def predict_energy_cm_dict(par, data2cm, mom2, irreps, levels,
+                           mL, MN, MK, n_refine=1000, step_mode="wave_adaptive",
+                           fit_mode="omega"):
+    """Predicted CM spectrum at a parameter point, in the same nested-dict shape
+    as :func:`build_energy_cm_dict`.
+
+    The predicted energy levels are the roots of the quantization condition
+    detQC(E)=0 at the given (fixed) parameters — no fitting is performed.  For
+    each (frame, irrep) block the roots come from the edge-stacked scanner
+    ``_scan_qc_roots`` (geomspace grids stacked at the NI walls + brentq — the
+    same recipe as plot_wave_predicted_energies): near-degenerate roots hugging
+    a wall (D-wave needles) sit inside the serial grid scan's ni_buffer and get
+    skipped there, which then mis-assigns each data level to the next root up.
+    The roots are matched to the block's data levels by optimal |ΔE| assignment,
+    so the result aligns level-by-level with ``build_energy_cm_dict(...)`` and
+    can be handed straight to :func:`plotting.plot_energies_vs_irreps` via its
+    ``predictions`` overlay.
+
+    The active quantum-number config (``set_quantum_numbers``) selects which
+    waves enter the QC — e.g. dropping the ³D₃ channel decouples that wave in
+    BMat while every other parameter stays identical.
+
+    Returns ``{PSQxx: {irrep: {level_idx: [Ecm_pred]}}}``; a level whose root is
+    missing (no QC solution in its window) maps to an empty list.
+    """
+    from scipy.optimize import linear_sum_assignment
+
+    _require_bmat()
+    par = np.asarray(par, dtype=float)
+
+    # group kept levels by (frame, irrep), preserving original indices
+    groups = {}
+    for idx, (mom, irrep) in enumerate(zip(mom2, irreps)):
+        key = (tuple(int(x) for x in np.asarray(mom).ravel()), str(irrep))
+        groups.setdefault(key, []).append(idx)
+
+    pred = {}
+    for (mom_tuple, irrep), level_indices in groups.items():
+        mom = np.array(mom_tuple, dtype=int)
+        psq = int(np.sum(mom ** 2))
+        d_e = np.array([float(np.asarray(data2cm[i]).ravel()[0])
+                        for i in level_indices], dtype=float)
+        nsols = len(d_e)
+
+        # Edge-stacked scan around the data window; widen until every data
+        # level can get a root (model variants can push roots well above the
+        # data, e.g. the no-3D3 T1g level ~0.03 above the top data point).
+        e_lo = float(d_e.min()) - 0.012
+        e_hi = float(d_e.max()) + 0.006
+        try:
+            for _ in range(4):
+                sols, _ = _scan_qc_roots(mom, irrep, e_lo, e_hi,
+                                         mL, MN, MK, par)
+                if len(sols) >= nsols:
+                    break
+                e_lo -= 0.02
+                e_hi += 0.05
+        except Exception as exc:
+            _progress_log(f"[predict] {irrep} PSq={psq}: edge-stacked scan "
+                          f"failed ({exc}); falling back to serial scan")
+            epsaux = 0.1 / float(n_refine)
+            sols = _findspectrum_irrep(
+                epsaux, nsols, mom, mL, par, irrep, MN, MK,
+                data_ecm=list(d_e), debug=False,
+                step_mode=step_mode, n_refine=n_refine, fit_mode=fit_mode)
+        roots = np.array(sorted(float(s) for s in (sols or [])), dtype=float)
+
+        # optimal (Hungarian) root->data assignment by |ΔE|.  Ties between
+        # near-degenerate roots can come back crossed; re-pair the chosen
+        # roots monotonically (never increases the total 1-D |ΔE| cost).
+        assign = np.full(nsols, np.nan)
+        if len(roots):
+            cost = np.abs(roots[:, None] - d_e[None, :])
+            ri, di = linear_sum_assignment(cost)
+            chosen = np.sort(roots[np.asarray(ri)])
+            di = np.asarray(di)
+            for r_val, b_ in zip(chosen, di[np.argsort(d_e[di])]):
+                assign[b_] = r_val
+
+        block = pred.setdefault(f"PSQ{psq}", {}).setdefault(irrep, {})
+        for k, orig_idx in enumerate(level_indices):
+            lvl = int(levels[orig_idx])
+            block[lvl] = [float(assign[k])] if np.isfinite(assign[k]) else []
+    return pred
+
+
+# One colour per physical wave (twoS, L, twoJ), shared by every figure —
+# phase-shift curves, per-wave energy columns, decomposition pies — so a wave
+# keeps its colour no matter how channels are ordered in the config.
+_WAVE_COLORS_FIXED = {
+    (2, 0, 2): "C0",   # 3S1
+    (2, 2, 2): "C2",   # 3D1
+    (2, 2, 4): "C3",   # 3D2
+    (2, 2, 6): "C1",   # 3D3
+}
+
+
+def _get_wave_plot_colors():
+    """(twoS, L, twoJ) → matplotlib colour.  Waves in _WAVE_COLORS_FIXED always
+    get their fixed colour; any other wave falls back to the channel-index
+    scheme (channel k → C{k}; a coupled channel's sub-waves get
+    [C{k}, C{k+2}, C{k+4}]), skipping colours already taken so no two waves in
+    one figure collide."""
+    enabled = [ch for ch in _normalize_qn_channels() if ch["enabled"]]
+    entries = []                      # (wave key, fallback colour) in draw order
+    for k, ch in enumerate(enabled):
+        twoS = int(ch.get("twoS", 0))
+        twoJ = int(ch.get("twoJ", 0))
+        lv = ch.get("L_values")
+        if lv is not None:
+            subs = [f"C{k}", f"C{(k + 2) % 20}", f"C{(k + 4) % 20}"]
+            for si, L in enumerate(sorted(set(int(v) for v in lv))):
+                entries.append(((twoS, int(L), twoJ), subs[si % len(subs)]))
+        else:
+            entries.append(((twoS, int(ch.get("L", 0)), twoJ), f"C{k}"))
+    cmap = {key: _WAVE_COLORS_FIXED[key] for key, _ in entries
+            if key in _WAVE_COLORS_FIXED}
+    used = set(cmap.values())
+    for key, fb in entries:
+        if key in cmap:
+            continue
+        col, ci = fb, int(fb[1:])
+        while col in used:
+            ci = (ci + 1) % 20
+            col = f"C{ci}"
+        cmap[key] = col
+        used.add(col)
+    return cmap
+
+
+def _single_wave_variants(par):
+    """Split the active config + global parameter vector into per-wave solo
+    fits: the QC of each partial wave alone, with its own best-fit K-matrix
+    parameters and everything else (incl. mixing) switched off.
+
+    A coupled channel with k_matrix [mode_L0, mode_L2, "epsilon"] contributes
+    one variant per L (its diagonal parameter group); parameter groups beyond
+    the L list — the mixing angle(s) — are dropped.  Uncoupled channels pass
+    through unchanged.  Disabled channels are skipped entirely.
+
+    Returns a list of dicts:
+        wave   : (twoS, L, twoJ) key
+        label  : spectroscopic LaTeX label (matches _get_active_wave_info)
+        qn     : quantum_numbers dict for set_quantum_numbers
+        idx    : np.ndarray of indices into the GLOBAL parameter vector
+        par    : par[idx] at the given central values
+    """
+    par = np.asarray(par, dtype=float)
+    _L_LABELS = {0: "S", 1: "P", 2: "D", 3: "F", 4: "G", 5: "H"}
+    variants = []
+    cursor = 0
+    for ch in _normalize_qn_channels():
+        groups = ch.get("_param_groups") or []
+        n_ch = int(sum(groups))
+        if not ch["enabled"]:
+            cursor += n_ch
+            continue
+        twoS = int(ch.get("twoS", 0))
+        twoJ = int(ch.get("twoJ", 0))
+        modes = ch.get("_k_matrix_modes")
+        lv = ch.get("L_values")
+        if lv is not None:
+            lvals = sorted(set(int(v) for v in lv))
+            g_start = cursor
+            for gi, gsize in enumerate(groups):
+                if gi < len(lvals):
+                    L = lvals[gi]
+                    mode = (modes[gi] if modes and gi < len(modes)
+                            else ch.get("k_matrix", "polynomial"))
+                    idx = np.arange(g_start, g_start + gsize)
+                    L_str = _L_LABELS.get(L, f"L{L}")
+                    label = rf"${{}}^{{{twoS + 1}}}{L_str}_{{{twoJ // 2}}}$"
+                    qn1 = {"channels": [{
+                        "name": f"solo_{twoS+1}{L_str}{twoJ//2}",
+                        "twoJ": twoJ, "L": L, "Lp": L,
+                        "twoS": twoS, "twoSp": twoS,
+                        "chan": 0, "chanp": 0, "enabled": True,
+                        "k_matrix": mode,
+                        "params": [{"name": f"c{k}", "initial": float(v)}
+                                   for k, v in enumerate(par[idx])],
+                    }]}
+                    variants.append({"wave": (twoS, L, twoJ), "label": label,
+                                     "qn": qn1, "idx": idx,
+                                     "par": par[idx].copy()})
+                # groups beyond len(lvals) are mixing parameters — dropped
+                g_start += gsize
+            cursor += n_ch
+        else:
+            L = int(ch.get("L", 0))
+            idx = np.arange(cursor, cursor + n_ch)
+            L_str = _L_LABELS.get(L, f"L{L}")
+            label = rf"${{}}^{{{twoS + 1}}}{L_str}_{{{twoJ // 2}}}$"
+            qn1 = {"channels": [dict(
+                {k: v for k, v in ch.items() if not k.startswith("_")},
+                params=[{"name": f"c{k}", "initial": float(v)}
+                        for k, v in enumerate(par[idx])],
+            )]}
+            variants.append({"wave": (twoS, L, twoJ), "label": label,
+                             "qn": qn1, "idx": idx, "par": par[idx].copy()})
+            cursor += n_ch
+    return variants
+
+
+def _scan_qc_roots(mom, irrep, e_lo, e_hi, mL, MN, MK, par1):
+    """All QC roots of the ACTIVE config in [e_lo, e_hi]: sign changes of the
+    C++ Omega on an edge-stacked grid inside each inter-NI window (D-wave
+    roots hug the walls), refined with brentq.  Same recipe as the validated
+    T1g solo-position test (scripts/plot_t1g_method_comparison.py)."""
+    from scipy.optimize import brentq
+
+    psq = int(np.sum(np.asarray(mom) ** 2))
+    frame_label = _frame_label_from_psq(psq)
+    qn_channels = _normalize_qn_channels()
+    max_L = 0
+    for ch in qn_channels:
+        if ch["enabled"]:
+            lv = ch.get("L_values")
+            if lv is not None:
+                for v in lv: max_L = max(max_L, int(v))
+            else:
+                max_L = max(max_L, int(ch.get("L", 0)))
+    par1 = np.asarray(par1, dtype=float)
+    calc = lambda J, Lp, Sp, chanp, L, S, chan, Ecm, pSqF: calcFunc_param(
+        J, Lp, Sp, chanp, L, S, chan, Ecm, pSqF, MN, MK, *par1)
+    kinv = BMat.KMatrix(calc, isZero)
+    cl = [BMat.DecayChannelInfo("n", "n", 1, 1, True, True)]
+    bq = BMat.BoxQuantization(frame_label, psq, irrep, cl, [max_L + 1], kinv, True)
+    bq.setRefMassL(mL)
+    bq.setMassesOverRef(0, MN, MK)
+
+    def om(e):
+        try:
+            return float(bq.getOmegaFromEcm(-1.0, float(e)))
+        except Exception:
+            return np.nan
+
+    ni = np.asarray(_generate_ni_levels(mL, np.asarray(mom), e_hi + 0.3),
+                    dtype=float)
+    e_lo = max(e_lo, 2.0 - 0.1)
+    walls = np.concatenate([[e_lo], ni[(ni > e_lo) & (ni < e_hi)], [e_hi]])
+    # Pole-flip guard: within ~1e-11 of an NI wall the numerical Omega flips
+    # sign off its saturation plateau without a true zero (verified on the g2
+    # A2 PSq=2 wall: genuine needle at wall-2.7e-5, spurious flip at
+    # wall-1e-11).  Discard "roots" closer than this to a window edge so they
+    # cannot steal the level assignment from the genuine near-wall needle.
+    eps_wall = 1e-9
+    roots = []
+    for lo, hi in zip(walls[:-1], walls[1:]):
+        w = hi - lo
+        if w < 1e-7:
+            continue
+        grid = np.unique(np.concatenate([
+            lo + w * np.geomspace(1e-7, 0.45, 220),
+            hi - w * np.geomspace(1e-7, 0.45, 220),
+            np.linspace(lo + 1e-9 * w, hi - 1e-9 * w, 320)]))
+        v = np.array([om(e) for e in grid])
+        ok = np.isfinite(v)
+        for i in np.where(ok[:-1] & ok[1:] & (v[:-1] * v[1:] < 0.0))[0]:
+            try:
+                r = float(brentq(om, grid[i], grid[i + 1], xtol=1e-11))
+            except Exception:
+                r = 0.5 * float(grid[i] + grid[i + 1])
+            if r - lo > eps_wall and hi - r > eps_wall:
+                roots.append(r)
+    return sorted(roots), (float(walls[0]), float(walls[-1]), ni)
+
+
+def _resolve_roots_for_samples(mom, irrep, mL, MN, MK, central_roots,
+                               par_matrix, ni, delta0=4e-4):
+    """σ68 of each central root over parameter samples: per sample, warm-start
+    brentq in a bracket around the central root (clamped at the NI walls,
+    expanded up to twice on a failed sign change).  Returns array of sigma68
+    aligned with central_roots (nan where fewer than 8 samples resolved)."""
+    from scipy.optimize import brentq
+
+    if par_matrix is None or len(par_matrix) == 0 or not central_roots:
+        return np.full(len(central_roots or []), np.nan)
+    psq = int(np.sum(np.asarray(mom) ** 2))
+    frame_label = _frame_label_from_psq(psq)
+    qn_channels = _normalize_qn_channels()
+    max_L = 0
+    for ch in qn_channels:
+        if ch["enabled"]:
+            lv = ch.get("L_values")
+            if lv is not None:
+                for v in lv: max_L = max(max_L, int(v))
+            else:
+                max_L = max(max_L, int(ch.get("L", 0)))
+    cl = [BMat.DecayChannelInfo("n", "n", 1, 1, True, True)]
+    ni = np.asarray(ni, dtype=float)
+    hits = [[] for _ in central_roots]
+    for p_s in par_matrix:
+        p_s = np.asarray(p_s, dtype=float)
+        calc = lambda J, Lp, Sp, chanp, L, S, chan, Ecm, pSqF, _p=p_s: \
+            calcFunc_param(J, Lp, Sp, chanp, L, S, chan, Ecm, pSqF, MN, MK, *_p)
+        kinv = BMat.KMatrix(calc, isZero)
+        bq = BMat.BoxQuantization(frame_label, psq, irrep, cl,
+                                  [max_L + 1], kinv, True)
+        bq.setRefMassL(mL)
+        bq.setMassesOverRef(0, MN, MK)
+
+        def om(e):
+            try:
+                return float(bq.getOmegaFromEcm(-1.0, float(e)))
+            except Exception:
+                return np.nan
+
+        for k, r0 in enumerate(central_roots):
+            below = ni[ni < r0]; above = ni[ni > r0]
+            wall_lo = float(below[-1]) + 1e-7 if len(below) else r0 - 0.05
+            wall_hi = float(above[0]) - 1e-7 if len(above) else r0 + 0.05
+            delta = delta0
+            for _try in range(3):
+                lo = max(r0 - delta, wall_lo)
+                hi = min(r0 + delta, wall_hi)
+                flo, fhi = om(lo), om(hi)
+                if np.isfinite(flo) and np.isfinite(fhi) and flo * fhi < 0:
+                    try:
+                        hits[k].append(float(brentq(om, lo, hi, xtol=1e-10)))
+                    except Exception:
+                        pass
+                    break
+                delta *= 4.0
+    sig = np.full(len(central_roots), np.nan)
+    for k, h in enumerate(hits):
+        if len(h) >= 8:
+            p16, p84 = np.percentile(h, [16, 84])
+            sig[k] = 0.5 * (p84 - p16)
+    return sig
+
+
+def plot_wave_predicted_energies(
+    par,
+    data2cm,
+    kept_mom2,
+    kept_irreps,
+    kept_levels,
+    mL,
+    MN,
+    MK,
+    par_samples=None,      # (N, n_par) bootstrap/vij parameter samples → σ68
+    n_par_samples=60,      # how many samples to use for the error bars
+    n_refine=1000,
+    step_mode="wave_adaptive",
+    e_margin_lo=0.012,
+    e_margin_hi=0.006,
+    save_path=None,
+    show=False,
+    title=None,
+    seed=0,
+    # ── styling, shared with plotting.plot_energies_vs_irreps ────────────────
+    ylabel=None,            # default r"$E^\star / m_N$", as the spectrum plot
+    style_registry=None,    # pass the spectrum's PointStyleRegistry to get
+                            # identical per-level colours across figures
+    y_from_data=True,       # frame the y-axis on the DATA levels only
+    y_top_pad=0.08,
+    y_bottom_pad=0.05,
+    show_legend=True,       # off for the lower panel of a stacked pair
+    show_level_labels=False,  # integer level index above each data point
+    figsize=None,           # (w, h) inches; pins the size independently of
+                            # whatever rcParams["figure.figsize"] happens to be
+):
+    """Per-irrep(P²) energies predicted by EACH PARTIAL WAVE ALONE at the
+    best-fit parameters, next to the data and the full-model prediction.
+
+    For every (P², irrep) block in the kept data:
+      * data levels (black, σ from the bootstrap sample spread of data2cm),
+      * full-model QC roots (open black squares, data-matched via
+        predict_energy_cm_dict),
+      * one column of coloured dashes per wave: the QC roots of that wave in
+        isolation (its diagonal K params only, mixing off — the solo spectra
+        validated as the level-attribution referee on T1g),
+    all with σ68 error bars from re-solving each root over ``par_samples``
+    (bootstrap parameter vectors preferred; Gaussian vij draws as fallback).
+
+    Returns a dict {(psq, irrep): {"data": ..., "model": ..., "solo": {label:
+    (roots, sigmas)}, "ni": ...}} for logging/reuse.
+    """
+    import matplotlib.pyplot as plt
+
+    _require_bmat()
+    par = np.asarray(par, dtype=float)
+    qn_full = copy.deepcopy(_ACTIVE_QN)
+    wave_colors = _get_wave_plot_colors()
+    variants = _single_wave_variants(par)
+
+    # subsample the parameter cloud once, shared by all blocks/waves
+    samp = None
+    if par_samples is not None and len(par_samples):
+        samp = np.asarray(par_samples, dtype=float)
+        if samp.shape[0] > n_par_samples:
+            rng = np.random.default_rng(seed)
+            samp = samp[rng.choice(samp.shape[0], n_par_samples,
+                                   replace=False)]
+
+    # ── group kept levels by (frame, irrep) in first-appearance order ────────
+    groups = {}
+    for idx, (mom, irrep) in enumerate(zip(kept_mom2, kept_irreps)):
+        key = (tuple(int(x) for x in np.asarray(mom).ravel()), str(irrep))
+        groups.setdefault(key, []).append(idx)
+
+    # ── Phase A: data + full-model roots/errors, per block (full config) ─────
+    # Full-model roots come from the same edge-stacked scanner as the solo
+    # spectra (_scan_qc_roots): near-degenerate roots hugging the NI walls are
+    # exactly the ones a uniform predict_energy_cm_dict scan can skip, which
+    # then mis-assigns a data level to the next root up.
+    results = {}
+    for (mom_tuple, irrep), lvl_idx in groups.items():
+        mom = np.array(mom_tuple, dtype=int)
+        psq = int(np.sum(mom ** 2))
+        d_rows = [np.asarray(data2cm[i], dtype=float).ravel()
+                  for i in lvl_idx]
+        d_e = np.array([r[0] for r in d_rows])
+        d_sig = np.array([float(np.std(r[1:])) if len(r) > 1 else np.nan
+                          for r in d_rows])
+        e_lo = float(d_e.min()) - e_margin_lo
+        e_hi = float(d_e.max()) + e_margin_hi
+
+        try:
+            roots_full, _ = _scan_qc_roots(
+                mom, irrep, e_lo, e_hi, mL, MN, MK, par)
+        except Exception as exc:
+            _progress_log(f"[wave-en] {irrep} PSq={psq} full model: "
+                          f"scan failed ({exc})")
+            roots_full = []
+        # nearest-root assignment, ascending in energy, each root used once
+        avail = list(roots_full)
+        model_e = np.full(len(d_e), np.nan)
+        for j in np.argsort(d_e):
+            if not avail:
+                break
+            k = int(np.argmin([abs(x - d_e[j]) for x in avail]))
+            model_e[j] = avail.pop(k)
+        ni = _generate_ni_levels(mL, mom, e_hi + 0.3)
+        model_sig = _resolve_roots_for_samples(
+            mom, irrep, mL, MN, MK,
+            [e for e in model_e if np.isfinite(e)], samp, ni)
+        ms_full = np.full(len(model_e), np.nan)
+        ms_full[np.isfinite(model_e)] = model_sig
+
+        results[(psq, irrep)] = {
+            "mom": mom,
+            "data": (d_e, d_sig),
+            "model": (model_e, ms_full),
+            "solo": {},
+            "ni": ni,
+            "window": (e_lo, e_hi),
+            "levels": [int(kept_levels[i]) for i in lvl_idx],
+        }
+
+    # ── Phase B: solo spectra per wave (one config switch per wave) ──────────
+    try:
+        for va in variants:
+            set_quantum_numbers(va["qn"])
+            for (psq, irrep), r in results.items():
+                mom = r["mom"]
+                e_lo, e_hi = r["window"]
+                try:
+                    roots, (_, _, ni) = _scan_qc_roots(
+                        mom, irrep, e_lo, e_hi, mL, MN, MK, va["par"])
+                except Exception as exc:
+                    _progress_log(f"[wave-en] {irrep} PSq={psq} "
+                                  f"{va['label']}: no QC basis ({exc})")
+                    r["solo"][va["label"]] = (np.array([]), np.array([]))
+                    continue
+                sig = _resolve_roots_for_samples(
+                    mom, irrep, mL, MN, MK, roots,
+                    samp[:, va["idx"]] if samp is not None else None, ni)
+                r["solo"][va["label"]] = (np.asarray(roots, dtype=float), sig)
+                _progress_log(
+                    f"[wave-en] {irrep} PSq={psq} {va['label']}: "
+                    f"{len(roots)} solo root(s) "
+                    + " ".join(f"{x:.5f}" for x in roots))
+    finally:
+        set_quantum_numbers(qn_full)
+
+    # ── figure ────────────────────────────────────────────────────────────────
+    # Styling deliberately mirrors plotting.plot_energies_vs_irreps (the main
+    # spectrum plot): same LaTeX irrep(P²) tick labels rotated 45°, same
+    # per-level data colours from PointStyleRegistry with black marker edges
+    # and level-index annotations, same '#404040' dashed NI lines, same 2m_N
+    # threshold marker, 0.05 y-ticks, and the same compact dual legend. Only
+    # the horizontal geometry differs: this figure stacks several sub-columns
+    # (data / full model / one per wave) inside each irrep slot, so slots are
+    # unit-spaced instead of the spectrum's irrep_gap = 0.2.
+    import matplotlib.lines as _mlines
+
+    if style_registry is None:
+        style_registry = pt.PointStyleRegistry()
+    tick_fs = plt.rcParams.get("xtick.labelsize", 16)
+    leg_fs = plt.rcParams.get("legend.fontsize", 12) * 0.85
+    ann_fs = plt.rcParams.get("legend.fontsize", 12) * 0.80
+    ms = plt.rcParams.get("lines.markersize", 8)
+
+    keys = list(results.keys())
+    n_waves = len(variants)
+    # Size follows rcParams when figure.figsize is set explicitly, so a paper
+    # figure can be drawn at its final on-page width (scale 1, no shrinking of
+    # markers and fonts).  Otherwise the width scales with the column count.
+    # An explicit figsize wins: the paper figures pin their on-page size in
+    # the config so a rerun does not inherit whatever figsize the ambient
+    # rcParams carry (that is how the panels drifted from 7.0x3.5 once).
+    _rc = None if figsize else plt.rcParams.get("figure.figsize", None)
+    if figsize:
+        fig_w, fig_h = float(figsize[0]), float(figsize[1])
+    else:
+        fig_w = (float(_rc[0]) if _rc else max(6.0, 1.35 * len(keys) + 2.2))
+        fig_h = float(_rc[1]) if _rc else 6.134
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=400)
+
+    x_data, x_model = -0.30, -0.10
+    x_solo0, dx_solo = 0.12, (0.55 / max(n_waves, 1))
+    half = 0.5 * dx_solo * 0.9          # half-width of a predicted-level tick
+    all_e, data_e = [], []
+    _labeled = set()   # wave legend entries added (a wave may have no roots
+                       # in the first block, e.g. 3D2 in T1g)
+
+    for ci, key in enumerate(keys):
+        psq, irrep = key
+        r = results[key]
+        x0 = ci
+        e_lo, e_hi = r["window"]
+        for e_ni in r["ni"]:
+            if e_lo - 0.004 < e_ni < e_hi + 0.004:
+                ax.hlines(e_ni, x0 - 0.42, x0 + 0.42, color="#8c8c8c",
+                          linestyle=(0, (5, 2.5)), linewidth=1.9, alpha=0.95,
+                          zorder=1)
+        # ── data: spectrum-style coloured points, black edges, level labels ──
+        d_e, d_sig = r["data"]
+        lvls = r.get("levels", list(range(len(d_e))))
+        psq_lbl = f"PSQ{psq}"
+        for e, s, lv in zip(d_e, d_sig, lvls):
+            color, marker = style_registry.style(lv, psq_lbl, irrep)
+            ax.errorbar(x0 + x_data, e, yerr=s, fmt=marker, color=color,
+                        markerfacecolor=color, markeredgecolor="black",
+                        markeredgewidth=0.8, markersize=ms,
+                        capsize=7, capthick=1.2, elinewidth=0.9,
+                        alpha=0.90, zorder=5)
+            if show_level_labels:
+                ax.annotate(str(int(lv)), xy=(x0 + x_data, e),
+                            xytext=(3, 3), textcoords="offset points",
+                            ha="left", va="bottom", color="dimgray",
+                            fontsize=ann_fs)
+        m_e, m_sig = r["model"]
+        fin = np.isfinite(m_e)
+        ax.errorbar(np.full(fin.sum(), x0 + x_model), m_e[fin],
+                    yerr=m_sig[fin], fmt="_", color="0.25",
+                    ms=11, mew=2.0, capsize=2, elinewidth=0.9, lw=0,
+                    zorder=4)
+        all_e += list(d_e) + list(m_e[fin])
+        data_e += list(d_e)
+        for wi, va in enumerate(variants):
+            roots, sig = r["solo"][va["label"]]
+            if not len(roots):
+                continue
+            col = wave_colors.get(va["wave"], f"C{wi}")
+            xw = x0 + x_solo0 + wi * dx_solo
+            _labeled.add(va["label"])
+            ax.errorbar(np.full(len(roots), xw), roots, yerr=sig,
+                        fmt="_", color=col, ms=11, mew=2.2, capsize=2,
+                        elinewidth=0.9, lw=0, zorder=4)
+            all_e += list(roots)
+
+    # ── axes: spectrum conventions ───────────────────────────────────────────
+    ax.set_xticks(range(len(keys)))
+    ax.set_xticklabels([f"{pt._format_irrep_label(ir)} ({psq})"
+                        for psq, ir in keys],
+                       rotation=45, ha="right", fontsize=tick_fs)
+    ax.set_xlim(-0.6, len(keys) - 1 + 0.75)
+
+    base = data_e if (y_from_data and data_e) else all_e
+    _ylo = _yhi = None
+    if base:
+        lo, hi = min(base), max(base)
+        rng = (hi - lo) or 0.1
+        _ylo, _yhi = lo - y_bottom_pad * rng, hi + y_top_pad * rng
+        ax.set_ylim(_ylo, _yhi)
+    if _ylo is not None:
+        # 0.05 leaves a narrow panel with one or two labelled ticks; step down
+        # until at least three fall inside the range.
+        for _step in (0.05, 0.02, 0.01, 0.005):
+            _t0 = np.ceil(_ylo / _step) * _step
+            yticks = np.arange(_t0, _yhi + 1e-9, _step)
+            if len(yticks) >= 3:
+                break
+        _dec = 2 if _step >= 0.01 else 3
+        ax.set_yticks(yticks)
+        ax.set_yticklabels([f"{t:.{_dec}f}" for t in yticks], fontsize=tick_fs)
+
+    if base and min(base) < 2.0:
+        ax.axhline(y=2.0, color="#AAAAAA", linestyle=":", linewidth=1.0,
+                   alpha=0.7, zorder=0)
+        ax.text((len(keys) - 1) / 2.0, 2.0, r"$2m_N$", ha="center", va="top",
+                color="#888888",
+                fontsize=plt.rcParams.get("legend.fontsize", 12))
+
+    ax.set_ylabel(ylabel or r"$E^{\star} / m_N$",
+                  fontsize=tick_fs * 1.2, labelpad=15)
+    if title:
+        ax.set_title(title)
+
+    # ── dual legend, same compact style as the spectrum plot ─────────────────
+    data_handle = _mlines.Line2D([], [], color="0.2", marker="o", ls="none",
+                                 markeredgecolor="black", markeredgewidth=0.8,
+                                 label="lattice data")
+    model_handle = _mlines.Line2D([], [], color="0.25", marker="_", ls="none",
+                                  ms=11, mew=2.0, label="full model")
+    wave_handles = [
+        _mlines.Line2D([], [], color=wave_colors.get(va["wave"], f"C{wi}"),
+                       marker="_", ls="none", ms=11, mew=2.2,
+                       label=va["label"])
+        for wi, va in enumerate(variants) if va["label"] in _labeled
+    ]
+    _leg_kw = dict(framealpha=0.85, fontsize=leg_fs, handlelength=1.6,
+                   borderpad=0.3, labelspacing=0.25, handletextpad=0.5,
+                   borderaxespad=0.25)
+    if show_legend:
+        leg1 = ax.legend(handles=[data_handle, model_handle], loc="upper center",
+                         bbox_to_anchor=(0.40, 1.0), **_leg_kw)
+        ax.add_artist(leg1)
+        if wave_handles:
+            ax.legend(handles=wave_handles, loc="upper center",
+                      bbox_to_anchor=(0.66, 1.0), **_leg_kw)
+
+    if _ylo is not None:
+        ax.set_ylim(_ylo, _yhi)   # re-assert after tick edits
+    fig.tight_layout()
+    if save_path:
+        os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+        fig.savefig(save_path, bbox_inches="tight", dpi=300)
+        _progress_log(f"[wave-en] saved {save_path}")
+    if show:
+        plt.show()
+    plt.close(fig)
+    return results
+
+
 def plot_bmatrix_preview(
     data2cm,
     kept_mom2,
@@ -2406,6 +3270,7 @@ def plot_bmatrix_preview(
     show= False,
     figsize=(8, 6.134),
     y_scale_mode='data_central',  # 'data_central' (QC-style, default) or 'cloud' (bootstrap cloud)
+    show_level_labels=False,      # integer level index next to each point
 ):
     """
     Plot ONLY the Lüscher lines (B matrix) and data points — no fit needed.
@@ -2513,11 +3378,16 @@ def plot_bmatrix_preview(
 
         kinv     = BMat.KMatrix(_dummy_calc, isZero)
         chan_list = [BMat.DecayChannelInfo("n", "n", 1, 1, True, True)]
-        box_q    = BMat.BoxQuantization(
-            frame_label, psq, irrep, chan_list, [max_L_bmat], kinv, True
-        )
-        box_q.setRefMassL(mL)
-        box_q.setMassesOverRef(0, MN, MK)
+        try:
+            box_q = BMat.BoxQuantization(
+                frame_label, psq, irrep, chan_list, [max_L_bmat], kinv, True
+            )
+            box_q.setRefMassL(mL)
+            box_q.setMassesOverRef(0, MN, MK)
+        except BaseException:
+            # Irrep has no overlap with the configured partial waves — skip it
+            _bq_cache[key] = None
+            return None
         _bq_cache[key] = box_q
         return box_q
 
@@ -2532,6 +3402,8 @@ def plot_bmatrix_preview(
     for idx, (mom, irrep) in enumerate(frame_irrep_list):
         psq   = int(np.sum(mom ** 2))
         box_q = _make_box_q(psq, irrep)
+        if box_q is None:
+            continue
         key   = (tuple(mom), irrep)
         luscher_color = irrep_luscher_color_map[key]
         marker        = irrep_marker_map[key]
@@ -2582,6 +3454,8 @@ def plot_bmatrix_preview(
 
         psq       = int(np.sum(np.asarray(mom) ** 2))
         box_q     = _make_box_q(psq, irrep)
+        if box_q is None:
+            continue
         key       = (tuple(mom), irrep)
         marker    = irrep_marker_map[key]
         level_idx = int(kept_levels[idx])
@@ -2662,7 +3536,7 @@ def plot_bmatrix_preview(
             y_for_limits.append(b_central)
 
             # ── annotate level index on first wave only ───────────────────
-            if iw == 0:
+            if show_level_labels and iw == 0:
                 ax.annotate(
                     f"{level_idx}",
                     xy=(p2_central, b_central),
@@ -2700,7 +3574,7 @@ def plot_bmatrix_preview(
         y_lo = y_arr.min()
         y_hi = y_arr.max()
         y_span = max(y_hi - y_lo, 0.05)
-        ypad = 0.12 * y_span
+        ypad = 0.08 * y_span
         y_lo_lim = y_lo - ypad
         y_hi_lim = y_hi + ypad
         y_floor = 0.08 * y_span
@@ -2771,6 +3645,7 @@ def plot_quantization_condition(
     save_path=None,
     show=False,
     figsize=(10, 7),
+    show_level_labels=False,   # integer level index next to each point
 ):
     """
     Plot the Lüscher quantization condition.
@@ -3007,7 +3882,7 @@ def plot_quantization_condition(
             )
             y_vals_data.append(b_central)
 
-            if iw == 0:
+            if show_level_labels and iw == 0:
                 ax.annotate(
                     f"{level_idx}",
                     xy=(p2_central, b_central),
@@ -3027,6 +3902,11 @@ def plot_quantization_condition(
             p2_sweep, model_kinv,
             color="#F4B6C2", lw=2.0, zorder=0
         )
+    # ── pion_threshold ────────────────────────────────────────────
+    ampi = 0.310810
+    k2_threshold = ampi**2 / 4
+    k2_threshold /= MN**2
+    ax.axvline(k2_threshold, color="gray", lw=0.8, ls="--", alpha=0.6)
     # ── aesthetics ───────────────────────────────────────────────────────────
     ax.axhline(0, color="gray", lw=0.8, ls="--", alpha=0.6)
 
@@ -3305,7 +4185,7 @@ def plot_quantization_condition(
             bbox={"boxstyle": "round,pad=0.45", "facecolor": "white", "alpha": 0.9, "edgecolor": "lightgray"},
             zorder=20,
         )
-
+    
     plt.tight_layout()
 
     if save_path:
@@ -3315,6 +4195,65 @@ def plot_quantization_condition(
         plt.show()
     plt.close(fig)
     return fig, ax
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+def bb_to_bar(delta_a_deg, delta_b_deg, eps_deg):
+    """Convert Blatt-Biedenharn eigenphases to Stapp "bar" phases (degrees).
+
+    The coupled K-matrix (``k_matrix: "coupled"``) is parametrized in the
+    Blatt-Biedenharn (BB) convention: two eigenphases and a mixing angle
+    [Blatt & Biedenharn, Phys. Rev. 86, 399 (1952)]. Experimental partial-wave
+    analyses (Nijmegen, SAID) quote the Stapp/nuclear-bar phases instead
+    [Stapp, Ypsilantis & Metropolis, Phys. Rev. 105, 302 (1957)], related
+    exactly (real S-matrix, below inelastic threshold) by
+        bar_a + bar_b        = d_a + d_b
+        sin(2 eps_bar)       = sin(2 eps) sin(d_a - d_b)
+        sin(bar_a - bar_b)   = tan(2 eps_bar) / tan(2 eps)
+
+    Parameters
+    ----------
+    delta_a_deg : array — BB eigenphase of the lower-L-dominant wave
+        (e.g. 3S1-dominant alpha wave), continuous in energy
+        (pass through _fix_phase_offset first).
+    delta_b_deg : array — BB eigenphase of the higher-L-dominant wave.
+    eps_deg     : array — BB mixing angle epsilon_J.
+
+    Returns
+    -------
+    (bar_a_deg, bar_b_deg, eps_bar_deg) — Stapp phases, e.g.
+    (delta(3S1), delta(3D1), eps1_bar). NaNs propagate.
+
+    Branch choice: bar_a - bar_b sits on the arcsin branch nearest
+    d_a - d_b, exact as eps -> 0 and unambiguous while the bar phases
+    differ from the eigenphases by O(eps^2) (the small-mixing NN case).
+    """
+    da = np.radians(np.asarray(delta_a_deg, dtype=float))
+    db = np.radians(np.asarray(delta_b_deg, dtype=float))
+    ep = np.radians(np.asarray(eps_deg, dtype=float))
+
+    diff = da - db
+    s2eb = np.clip(np.sin(2.0 * ep) * np.sin(diff), -1.0, 1.0)
+    eps_bar = 0.5 * np.arcsin(s2eb)
+
+    # sin(bar_diff) = tan(2 eps_bar)/tan(2 eps); its eps->0 limit is sin(diff)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r = np.tan(2.0 * eps_bar) / np.tan(2.0 * ep)
+    r = np.where(np.abs(ep) < 1e-12, np.sin(diff), r)
+    r = np.clip(r, -1.0, 1.0)
+
+    # candidates: arcsin branch (d0 + 2*pi*n) and supplement (pi - d0 + 2*pi*n);
+    # take whichever lands nearest the BB difference
+    d0 = np.arcsin(r)
+    c1 = d0 + 2.0 * np.pi * np.round((diff - d0) / (2.0 * np.pi))
+    c2s = np.pi - d0
+    c2 = c2s + 2.0 * np.pi * np.round((diff - c2s) / (2.0 * np.pi))
+    bar_diff = np.where(np.abs(c1 - diff) <= np.abs(c2 - diff), c1, c2)
+
+    bar_sum = da + db
+    bar_a = 0.5 * (bar_sum + bar_diff)
+    bar_b = 0.5 * (bar_sum - bar_diff)
+    return np.degrees(bar_a), np.degrees(bar_b), np.degrees(eps_bar)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3337,6 +4276,37 @@ def plot_phase_shifts_multichannel(
     L_lattice=None,    # integer lattice size (for NI band computation)
     n_par_samples=400,
     figsize=(10, 8),
+    par_samples=None,  # (N, n_par) bootstrap parameter sets: bands from the
+                       # middle 68% of these curves instead of vij draws
+    ecm_grid=None,     # explicit (sorted) energy grid; overrides n_sweep.
+                       # Densify locally where a K-matrix element crosses zero
+                       # to resolve a rapid 90° passage as a continuous rise.
+    phase_convention="fold",  # "fold": wrap δ into (−90°, +90°] (δ and δ−180°
+                       # are the same physics), drawing a break at any 90°
+                       # passage. "continuous": let δ run through 90° to 180°.
+    level_wave_pies=True,  # bottom panel: draw each level as a pie circle whose
+                       # wedges show the QC null-eigenvector wave content
+                       # (eigenvector_decomposition), coloured like the top-panel
+                       # waves. Falls back to the old irrep markers + legend if
+                       # the decomposition is unavailable.
+    eigvec_results=None,  # precomputed eigenvector_decomposition() output; None
+                       # → computed here at `par` when level_wave_pies is True.
+    pie_size=220.0,    # pie marker area (matplotlib scatter `s` units)
+    show_level_labels=False,  # bottom panel: annotate each level with its index.
+                       # Off by default: the indices are noise on a published
+                       # figure.  Turn on only for level-selection diagnostics.
+    bottom_ylabel="levels",  # bottom-panel y-axis title; None to omit it
+                       # (the panel has no y scale, so the title is optional)
+    label_fontsize=None,     # axis-title size (both axes); default axes.labelsize
+    legend_loc="lower left", # top-panel legend placement
+    mixing_convention="bb",  # coupled-channel phase convention:
+                       # "bb"  — plot the Blatt-Biedenharn eigenphases exactly
+                       #         as parametrized, labelled honestly as
+                       #         δ_{Jα}, δ_{Jβ}, ε_J (BB);
+                       # "bar" — convert per curve (and per bootstrap draw)
+                       #         to Stapp/nuclear-bar phases via bb_to_bar(),
+                       #         labelled ³S₁, ³D₁, ε̄_J — the convention
+                       #         quoted by Nijmegen/SAID PWAs.
 ):
     """
     Two-panel phase-shift summary for multiple independent (non-mixing) channels.
@@ -3344,12 +4314,27 @@ def plot_phase_shifts_multichannel(
     Panel a (top, larger): phase shift δ in degrees vs E*/mN for each enabled,
         single-channel wave — each channel gets its own colour + ±1σ band from vij.
     Panel b (bottom): input data energies as horizontal error bars with NI energy
-        bands (grey shaded ± 1σ from bootstrap mN), coloured by irrep(psq) combo.
+        bands (grey shaded ± 1σ from bootstrap mN). With level_wave_pies (default)
+        each level is a small pie chart of its wave content from the QC
+        null-eigenvector decomposition, using the top-panel wave colours — so the
+        top legend is the only colour key. Otherwise levels are irrep-coded
+        markers with their own legend.
     Shared x-axis: E*/mN.
     """
     import matplotlib.pyplot as plt
     import matplotlib.cm as cm_module
+    import matplotlib.patches as mpatches
+    import matplotlib.transforms as mtransforms
     import os
+    import shutil as _shutil
+
+    # workspace-wide figure style (serif/LaTeX, 16pt labels, 14pt legend) —
+    # same as the spectrum plots; fall back to mathtext if latex is absent
+    try:
+        from plotting import apply_plot_style
+        apply_plot_style(use_tex=bool(_shutil.which("latex")))
+    except Exception:
+        pass
 
     _L_LABELS = {0: "S", 1: "P", 2: "D", 3: "F", 4: "G", 5: "H"}
 
@@ -3360,14 +4345,34 @@ def plot_phase_shifts_multichannel(
     par = np.asarray(par, dtype=float)
 
     # ── ecm range ─────────────────────────────────────────────────────────────
-    ecm_means = np.array([float(e[0]) for e in data2cm])
-    padding   = 0.05 * (ecm_means.max() - ecm_means.min() or 0.1)
-    ecm_lo    = (ecm_means.min() - padding) if ecm_min is None else float(ecm_min)
-    ecm_hi    = (ecm_means.max() + padding) if ecm_max is None else float(ecm_max)
-    ecm_sweep = np.linspace(ecm_lo, ecm_hi, n_sweep)
+    if ecm_grid is not None:
+        ecm_sweep = np.sort(np.asarray(ecm_grid, dtype=float).ravel())
+        ecm_lo, ecm_hi = float(ecm_sweep[0]), float(ecm_sweep[-1])
+    else:
+        ecm_means = np.array([float(e[0]) for e in data2cm])
+        padding   = 0.05 * (ecm_means.max() - ecm_means.min() or 0.1)
+        ecm_lo    = (ecm_means.min() - padding) if ecm_min is None else float(ecm_min)
+        ecm_hi    = (ecm_means.max() + padding) if ecm_max is None else float(ecm_max)
+        ecm_sweep = np.linspace(ecm_lo, ecm_hi, n_sweep)
 
     # ── channels ──────────────────────────────────────────────────────────────
     qn_channels = _normalize_qn_channels()
+
+    # ── parameter draws for uncertainty bands ─────────────────────────────────
+    # Bootstrap samples (par_samples) take precedence over Gaussian vij draws;
+    # the band is always the pointwise middle 68% (16th-84th percentile) of
+    # the resulting curves.
+    if par_samples is not None:
+        _band_draws = np.asarray(par_samples, dtype=float)
+    elif vij is not None:
+        _vij_arr = np.asarray(vij, dtype=float)
+        try:
+            _band_draws = np.random.multivariate_normal(par, _vij_arr, size=n_par_samples)
+        except np.linalg.LinAlgError:
+            _band_draws = np.random.multivariate_normal(
+                par, np.diag(np.diag(_vij_arr)), size=n_par_samples)
+    else:
+        _band_draws = None
 
     # ── unique (mom, irrep) combos for colouring data & NI ────────────────────
     seen_combos   = {}
@@ -3453,8 +4458,372 @@ def plot_phase_shifts_multichannel(
 
     # ── TOP: phase shifts ──────────────────────────────────────────────────────
     ax_top.axhline(0,  color="grey", lw=0.7, ls="--")
-    ax_top.axhline(90, color="grey", lw=0.5, ls=":", alpha=0.5)
     _draw_ni(ax_top)
+
+    # y-values of the central curves — the axis is fitted to the waves
+    # themselves; band extents are kept separately and only enter the axis
+    # through their 1st-99th percentile, so a blown-up band cannot stretch it
+    _wave_yvals = []
+    _band_yvals = []
+    # (twoS, L, twoJ) → curve colour, filled while drawing the top panel; the
+    # bottom-panel wave pies reuse these so one legend serves both panels
+    _wave_color_map = {}
+    # identity-keyed palette (fixed colours for 3S1/3D1/3D2/3D3, collision-free
+    # fallback otherwise) — overrides the channel-index colour wave by wave
+    _wave_cmap = _get_wave_plot_colors()
+
+    # ── helper: extract sub-channels from a coupled BB channel ───────────────
+    def _expand_channel(ch):
+        """
+        For a coupled channel (k_matrix is a list, e.g. ["poly_s","poly_s","epsilon"]),
+        yield synthetic single-channel dicts for each wave so they can be plotted.
+        For a plain uncoupled channel, yield the channel itself unchanged.
+
+        Coupled BB layout (3 groups): [wave-a params, wave-b params, mixing params]
+        k_matrix modes:                [mode_a,         mode_b,        "epsilon"]
+        L_values:                      [La, Lb]
+
+        Yields sub-channel dicts with keys: L, twoJ, twoS, twoSp, chan, chanp,
+        _coeffs (sliced param array), _k_mode (string), _label (spectroscopic).
+        """
+        k_mode = ch.get("k_matrix", "polynomial")
+        if not (isinstance(k_mode, list) or str(k_mode).strip().lower().startswith("coupled")):
+            yield ch
+            return
+
+        L_values = ch.get("L_values")
+        if L_values is None or len(L_values) < 2:
+            return   # can't decompose without L_values
+        lvals = sorted(int(v) for v in L_values)
+        La, Lb = lvals[0], lvals[1]
+
+        modes = ch.get("_k_matrix_modes") or (k_mode if isinstance(k_mode, list) else [])
+        pg    = ch.get("_param_groups", [])
+        slc   = ch.get("slice", slice(0, 0))
+        flat  = par[slc]
+
+        # Split flat params into groups
+        off = 0
+        groups = []
+        for sz in pg:
+            groups.append(flat[off:off+sz])
+            off += sz
+        if len(groups) < 2:
+            return
+
+        twoJ = int(ch.get("twoJ", 2))
+        twoS = int(ch.get("twoS", 2))
+        chan = int(ch.get("chan", 0))
+
+        sub_infos = [
+            (La, modes[0] if len(modes) > 0 else "poly_s", groups[0]),
+            (Lb, modes[1] if len(modes) > 1 else "poly_s", groups[1]),
+        ]
+        # Also yield mixing angle (epsilon) if present
+        if len(groups) >= 3 and len(modes) >= 3 and modes[2] == "epsilon":
+            sub_infos.append(("epsilon", "epsilon", groups[2]))
+
+        for item in sub_infos:
+            L_sub, mode_sub, coeffs_sub = item
+            if L_sub == "epsilon":
+                yield {"_is_epsilon": True, "_coeffs": coeffs_sub, "_label": r"$\varepsilon$ (mixing)"}
+            else:
+                yield {
+                    "L": L_sub, "Lp": L_sub, "twoJ": twoJ,
+                    "twoS": twoS, "twoSp": twoS, "chan": chan, "chanp": chan,
+                    "_coeffs": coeffs_sub, "_k_mode": mode_sub,
+                    "_label": _spec_label(twoS, L_sub, twoJ),
+                }
+
+    def _delta_for_sub(p_arr, sub, slc):
+        """Compute phase shift array for a sub-channel (wave within coupled channel)."""
+        L_ch = int(sub["L"])
+        out  = []
+        # Re-slice coefficients from p_arr using the same slice offset
+        pg   = sub.get("_param_groups_offset", None)
+        # Fall back to stored coeffs (offset from full par)
+        # We recompute the offset each call using sub's stored group slice
+        coeffs_sub = sub["_coeffs_fn"](p_arr)
+        for ecm in ecm_sweep:
+            p2 = ecm ** 2 / 4.0 - 1.0
+            if p2 <= 0.0:
+                out.append(np.nan)
+                continue
+            p = np.sqrt(p2)
+            try:
+                kinv    = float(_evaluate_k_matrix(sub["_k_mode"], coeffs_sub, p2,
+                                                   Ecm_over_mref=ecm, MN=MN, MK=MK))
+                barrier = p ** (2 * L_ch + 1)
+                out.append(np.degrees(np.arctan2(barrier, kinv)))
+            except Exception:
+                out.append(np.nan)
+        return np.array(out, dtype=float)
+
+    def _epsilon_for_sub(p_arr, sub):
+        """Compute mixing angle ε (in degrees) vs ecm_sweep."""
+        coeffs_sub = sub["_coeffs_fn"](p_arr)
+        out = []
+        for ecm in ecm_sweep:
+            p2 = ecm**2/4.0 - 1.0
+            if p2 <= 0.0:
+                out.append(np.nan)
+                continue
+            try:
+                theta = float(_evaluate_k_matrix("epsilon", coeffs_sub, p2,
+                                                  Ecm_over_mref=ecm, MN=MN, MK=MK))
+                out.append(np.degrees(theta))
+            except Exception:
+                out.append(np.nan)
+        return np.array(out, dtype=float)
+
+    def _plot_channel(ch, color):
+        """Plot one channel (single or coupled sub-channel) on ax_top."""
+        k_mode = ch.get("k_matrix", "polynomial")
+        is_coupled = isinstance(k_mode, list) or str(k_mode).strip().lower().startswith("coupled")
+
+        if not is_coupled:
+            # plain single channel — prefer the spectroscopic label over the raw
+            # config name (e.g. "3D3_channel" → $^3D_3$)
+            delta_central = _delta_for_channel(par, ch)
+            if all(k in ch for k in ("twoS", "L", "twoJ")):
+                label = _spec_label(int(ch["twoS"]), int(ch["L"]), int(ch["twoJ"]))
+            else:
+                label = ch.get("name", None) or _spec_label(
+                    int(ch.get("twoS", 0)), int(ch.get("L", 0)), int(ch.get("twoJ", 0)))
+            _wkey = (int(ch.get("twoS", 0)), int(ch.get("L", 0)),
+                     int(ch.get("twoJ", 0)))
+            color = _wave_cmap.get(_wkey, color)
+            _wave_color_map[_wkey] = color
+            _draw_one(ax_top, ecm_sweep, delta_central, color, label,
+                      ch, is_epsilon=False)
+        else:
+            # decompose coupled channel into sub-waves
+            L_values = ch.get("L_values")
+            if L_values is None or len(L_values) < 2:
+                return
+            lvals  = sorted(int(v) for v in L_values)
+            La, Lb = lvals[0], lvals[1]
+            modes  = ch.get("_k_matrix_modes") or (k_mode if isinstance(k_mode, list) else [])
+            pg     = ch.get("_param_groups", [])
+            slc    = ch.get("slice", slice(0, 0))
+            twoJ   = int(ch.get("twoJ", 2))
+            twoS   = int(ch.get("twoS", 2))
+            J_sub  = twoJ // 2
+
+            # Build param-group slicers relative to the full par array
+            group_offsets = []
+            off = slc.start
+            for sz in pg:
+                group_offsets.append((off, off + sz))
+                off += sz
+
+            has_eps  = (len(modes) >= 3 and modes[2] == "epsilon"
+                        and len(group_offsets) >= 3)
+            # bar conversion needs the mixing angle; without one BB == bar
+            bar_mode = (str(mixing_convention).strip().lower().startswith("bar")
+                        and has_eps)
+
+            def _bb_triplet(p_arr):
+                """Raw BB curves over ecm_sweep: (δ_α, δ_β, ε) in degrees."""
+                n_pts = len(ecm_sweep)
+                out = [np.full(n_pts, np.nan) for _ in range(3)]
+                for ei, ecm in enumerate(ecm_sweep):
+                    p2 = ecm ** 2 / 4.0 - 1.0
+                    if p2 <= 0.0:
+                        continue
+                    p = np.sqrt(p2)
+                    for gi, L_s in enumerate((La, Lb)):
+                        if gi >= len(group_offsets):
+                            break
+                        a, b = group_offsets[gi]
+                        try:
+                            kinv = float(_evaluate_k_matrix(
+                                modes[gi], p_arr[a:b], p2,
+                                Ecm_over_mref=ecm, MN=MN, MK=MK))
+                            barrier = p ** (2 * L_s + 1)
+                            out[gi][ei] = np.degrees(np.arctan2(barrier, kinv))
+                        except Exception:
+                            pass
+                    if has_eps:
+                        a, b = group_offsets[2]
+                        try:
+                            out[2][ei] = np.degrees(float(_evaluate_k_matrix(
+                                "epsilon", p_arr[a:b], p2,
+                                Ecm_over_mref=ecm, MN=MN, MK=MK)))
+                        except Exception:
+                            pass
+                return out
+
+            def _conv_curves(p_arr, ref=None):
+                """Convention-resolved curves [wave_a, wave_b, ε] (degrees).
+
+                Wave curves come back continuous & threshold-anchored
+                (_fix_phase_offset). With `ref` = central (δ_α, δ_β), each
+                draw is folded onto the central branch BEFORE the bar
+                conversion so a draw anchored 180° away cannot flip the
+                sign of ε̄.
+                """
+                da, db_, ep = _bb_triplet(p_arr)
+                da  = _fix_phase_offset(da)
+                db_ = _fix_phase_offset(db_)
+                if ref is not None:
+                    with np.errstate(all="ignore"):
+                        da  = da  - 180.0 * np.round((da  - ref[0]) / 180.0)
+                        db_ = db_ - 180.0 * np.round((db_ - ref[1]) / 180.0)
+                if bar_mode:
+                    da, db_, ep = bb_to_bar(da, db_, ep)
+                return [da, db_, ep]
+
+            _da0, _db0, _ep0 = _bb_triplet(par)
+            _da0, _db0 = _fix_phase_offset(_da0), _fix_phase_offset(_db0)
+            _bb_ref = (_da0, _db0)
+            if bar_mode:
+                central_curves = list(bb_to_bar(_da0, _db0, _ep0))
+            else:
+                central_curves = [_da0, _db0, _ep0]
+
+            draw_curves = None
+            if _band_draws is not None:
+                draw_curves = [_conv_curves(d, ref=_bb_ref)
+                               for d in _band_draws]
+
+            # labels: BB eigenphases as δ_{Jα}/δ_{Jβ}/ε_J; bar phases get the
+            # spectroscopic wave names (³S₁, ³D₁, …) and ε̄_J
+            if bar_mode:
+                lab_a   = _spec_label(twoS, La, twoJ)
+                lab_b   = _spec_label(twoS, Lb, twoJ)
+                lab_eps = rf"$\bar{{\varepsilon}}_{{{J_sub}}}$"
+            else:
+                lab_a   = rf"$\delta_{{{J_sub}\alpha}}$"
+                lab_b   = rf"$\delta_{{{J_sub}\beta}}$"
+                lab_eps = rf"$\varepsilon_{{{J_sub}}}$"
+
+            sub_defs = []
+            for gi, (L_s, lab_s) in enumerate(zip([La, Lb], [lab_a, lab_b])):
+                if gi >= len(group_offsets):
+                    break
+                sub_defs.append({
+                    "L": L_s, "twoJ": twoJ, "twoS": twoS,
+                    "_label": lab_s, "_curve_idx": gi,
+                })
+            if has_eps:
+                sub_defs.append({
+                    "_is_epsilon": True,
+                    "_label": lab_eps,
+                    "_curve_idx": 2,
+                })
+
+            sub_colors = [color,
+                          f"C{(channel_colors.index(color) + 2) % 20}",
+                          f"C{(channel_colors.index(color) + 4) % 20}"]
+
+            for si, sub in enumerate(sub_defs):
+                sc = sub_colors[si % len(sub_colors)]
+                is_eps = sub.get("_is_epsilon", False)
+                ci_sub = sub["_curve_idx"]
+                if not is_eps:
+                    sc = _wave_cmap.get((twoS, int(sub["L"]), twoJ), sc)
+                    _wave_color_map[(twoS, int(sub["L"]), twoJ)] = sc
+
+                delta_c = central_curves[ci_sub].copy()
+                if not is_eps and str(phase_convention).lower().startswith("fold"):
+                    # δ ≡ δ − 180°: wrap onto the branch nearest 0 pointwise
+                    with np.errstate(all="ignore"):
+                        delta_c = delta_c - 180.0 * np.round(delta_c / 180.0)
+                label   = sub["_label"]
+
+                # uncertainty band (bootstrap samples or vij draws)
+                if draw_curves is not None:
+                    samp = np.array([dc[ci_sub] for dc in draw_curves])
+                    if not is_eps:
+                        # δ is defined mod 180°: fold every sample onto the
+                        # central curve's branch so draws whose fold point
+                        # moved don't smear the band across branches
+                        with np.errstate(all="ignore"):
+                            samp = samp - 180.0 * np.round((samp - delta_c[None, :]) / 180.0)
+                    with np.errstate(all="ignore"):
+                        d_lo = np.nanpercentile(samp, 16, axis=0)
+                        d_hi = np.nanpercentile(samp, 84, axis=0)
+                    valid = np.isfinite(d_lo) & np.isfinite(d_hi)
+                    if valid.any():
+                        ax_top.fill_between(ecm_sweep[valid], d_lo[valid], d_hi[valid],
+                                            color=sc, alpha=0.20, zorder=2)
+                        _band_yvals.append(d_lo[valid]); _band_yvals.append(d_hi[valid])
+
+                ls = "--" if is_eps else "-"
+                # break the line where the mod-180 fold produces a false
+                # vertical connector (rapid pass through ±90)
+                delta_plot = delta_c.copy()
+                with np.errstate(all="ignore"):
+                    _dj = np.abs(np.diff(np.where(np.isfinite(delta_plot), delta_plot, np.nan)))
+                for _k in np.where(_dj > 60.0)[0]:
+                    delta_plot[_k] = delta_plot[_k + 1] = np.nan
+                # axis range follows the drawn (punched) curve, not fold spikes
+                if np.isfinite(delta_plot).any():
+                    _wave_yvals.append(delta_plot[np.isfinite(delta_plot)])
+                ax_top.plot(ecm_sweep, delta_plot, color=sc, lw=2.0, ls=ls, label=label, zorder=3)
+
+    def _fix_phase_offset(delta):
+        """
+        Make δ(E) continuous and anchor the threshold branch at 0°.
+
+        arctan2(barrier, kinv) returns values in (0°, 180°), so a wave whose
+        K-matrix is negative at threshold comes out starting at 180° instead
+        of 0°.  δ and δ±180° are the same physics, so:
+          1. unwrap: remove the ±180° jumps that occur when kinv crosses a
+             pole, keeping the curve continuous in E;
+          2. anchor: shift the whole curve by the multiple of 180° that puts
+             the first finite (lowest-energy) value closest to 0°.
+        """
+        delta = np.asarray(delta, dtype=float).copy()
+        fin = np.where(np.isfinite(delta))[0]
+        if len(fin) == 0:
+            return delta
+        vals = delta[fin]
+        unwrapped = vals.copy()
+        offset = 0.0
+        for i in range(1, len(vals)):
+            step = vals[i] + offset - unwrapped[i - 1]
+            if step > 90.0:
+                offset -= 180.0
+            elif step < -90.0:
+                offset += 180.0
+            unwrapped[i] = vals[i] + offset
+        unwrapped -= 180.0 * np.round(unwrapped[0] / 180.0)
+        delta[fin] = unwrapped
+        return delta
+
+    def _draw_one(ax, x, y, color, label, ch, is_epsilon=False):
+        y = _fix_phase_offset(y) if not is_epsilon else y
+        if not is_epsilon and str(phase_convention).lower().startswith("fold"):
+            with np.errstate(all="ignore"):
+                y = y - 180.0 * np.round(y / 180.0)
+        if _band_draws is not None:
+            draws = _band_draws
+            samp = np.array([
+                (_fix_phase_offset(_delta_for_channel(d, ch)) if not is_epsilon
+                 else _delta_for_channel(d, ch))
+                for d in draws
+            ])
+            if not is_epsilon:
+                # fold samples onto the central branch (δ defined mod 180°)
+                with np.errstate(all="ignore"):
+                    samp = samp - 180.0 * np.round((samp - y[None, :]) / 180.0)
+            with np.errstate(all="ignore"):
+                d_lo = np.nanpercentile(samp, 16, axis=0)
+                d_hi = np.nanpercentile(samp, 84, axis=0)
+            valid = np.isfinite(d_lo) & np.isfinite(d_hi)
+            if valid.any():
+                ax.fill_between(x[valid], d_lo[valid], d_hi[valid], color=color, alpha=0.20, zorder=2)
+                _band_yvals.append(d_lo[valid]); _band_yvals.append(d_hi[valid])
+        yp = y.copy()
+        with np.errstate(all="ignore"):
+            _dj = np.abs(np.diff(np.where(np.isfinite(yp), yp, np.nan)))
+        for _k in np.where(_dj > 60.0)[0]:
+            yp[_k] = yp[_k + 1] = np.nan
+        if np.isfinite(yp).any():
+            _wave_yvals.append(yp[np.isfinite(yp)])
+        ax.plot(x, yp, color=color, lw=2.0, label=label, zorder=3)
 
     # pre-draw vij band (low z-order) then central line
     channel_colors = [f"C{i}" for i in range(20)]
@@ -3462,95 +4831,261 @@ def plot_phase_shifts_multichannel(
     for ch in qn_channels:
         if not ch.get("enabled", True):
             continue
-        k_mode = ch.get("k_matrix", "polynomial")
-        # skip coupled / multi-wave channels
-        if isinstance(k_mode, list) or str(k_mode).strip().lower().startswith("coupled"):
-            continue
-
-        L_ch  = int(ch.get("L", 0))
-        twoJ  = int(ch.get("twoJ", 0))
-        twoS  = int(ch.get("twoS", 0))
-        label = ch.get("name", None) or _spec_label(twoS, L_ch, twoJ)
         color = channel_colors[ch_idx % len(channel_colors)]
         ch_idx += 1
+        _plot_channel(ch, color)
 
-        delta_central = _delta_for_channel(par, ch)
-
-        # ±1σ band from vij
-        if vij is not None:
-            vij_arr = np.asarray(vij, dtype=float)
-            try:
-                draws = np.random.multivariate_normal(par, vij_arr, size=n_par_samples)
-            except np.linalg.LinAlgError:
-                draws = np.random.multivariate_normal(
-                    par, np.diag(np.diag(vij_arr)), size=n_par_samples)
-            samp  = np.array([_delta_for_channel(d, ch) for d in draws])
-            d_lo  = np.nanpercentile(samp, 16, axis=0)
-            d_hi  = np.nanpercentile(samp, 84, axis=0)
-            ax_top.fill_between(ecm_sweep, d_lo, d_hi,
-                                color=color, alpha=0.20, zorder=2)
-
-        # mask large jumps (phase-wrap artifacts)
-        delta_plot = delta_central.copy()
-        jumps = np.where(np.abs(np.diff(np.where(np.isfinite(delta_plot),
-                                                  delta_plot, 0.0))) > 90)[0]
-        for j in jumps:
-            delta_plot[j] = delta_plot[j + 1] = np.nan
-
-        ax_top.plot(ecm_sweep, delta_plot, color=color, lw=2.0,
-                    label=label, zorder=3)
-
-    ax_top.set_ylabel(r"$\delta$ (degrees)")
-    ax_top.set_ylim(-5, 185)
-    ax_top.set_yticks([0, 45, 90, 135, 180])
-    ax_top.legend(loc="best", fontsize="small", frameon=True)
-    ax_top.set_title("Phase shifts from fit parametrization")
+    _lbl_fs = (label_fontsize if label_fontsize is not None
+               else float(plt.rcParams.get("axes.labelsize", 14)))
+    ax_top.set_ylabel(r"$\delta$ (degrees)", labelpad=14, fontsize=_lbl_fs)
+    # ── axis fitted to the waves themselves ──────────────────────────────────
+    if _wave_yvals:
+        _yall = np.concatenate(_wave_yvals)
+        _yall = _yall[np.isfinite(_yall)]
+    else:
+        _yall = np.array([])
+    if len(_yall):
+        y_lo, y_hi = float(np.min(_yall)), float(np.max(_yall))
+        if _band_yvals:
+            _ball = np.concatenate(_band_yvals)
+            _ball = _ball[np.isfinite(_ball)]
+            if len(_ball):
+                # let bands widen the axis, but only their robust bulk
+                y_lo = min(y_lo, float(np.percentile(_ball, 1)))
+                y_hi = max(y_hi, float(np.percentile(_ball, 99)))
+        span = max(y_hi - y_lo, 1.0)
+        pad  = 0.06 * span
+        y_lo, y_hi = y_lo - pad, y_hi + pad
+        # pick a clean tick step giving ~5-8 ticks
+        for _step in (1, 2, 5, 10, 15, 30, 45, 90):
+            if (y_hi - y_lo) / _step <= 8:
+                break
+        ticks = np.arange(np.floor(y_lo / _step) * _step,
+                          np.ceil(y_hi / _step) * _step + 0.5 * _step, _step)
+        ax_top.set_ylim(y_lo, y_hi)
+        ax_top.set_yticks(ticks[(ticks >= y_lo) & (ticks <= y_hi)])
+    else:
+        ax_top.set_ylim(-5, 185)
+        ax_top.set_yticks([0, 45, 90, 135, 180])
+    ax_top.legend(loc=legend_loc, frameon=True, framealpha=0.9,
+                  fontsize=plt.rcParams.get("legend.fontsize", 12),
+                  handlelength=1.5, labelspacing=0.25, borderpad=0.35,
+                  handletextpad=0.5, borderaxespad=0.4, ncol=1)
 
     # ── BOTTOM: data energies + NI ────────────────────────────────────────────
     _draw_ni(ax_bot)
     ax_bot.set_yticks([])
-    ax_bot.set_ylabel("levels", fontsize="small")
+    if bottom_ylabel:
+        ax_bot.set_ylabel(bottom_ylabel, fontsize=_lbl_fs)
 
+    # ── wave-content pies: QC null-eigenvector decomposition per level ───────
+    # Each level becomes a circle whose wedges are the |v_i|² wave weights,
+    # coloured like the top-panel curves — the top legend is the only key.
+    _pie_by_idx = {}
+    if level_wave_pies:
+        if eigvec_results is None:
+            try:
+                eigvec_results = eigenvector_decomposition(
+                    par, data2cm, kept_mom2, kept_irreps, kept_levels,
+                    mL, MN, MK, n_refine=800, step_mode="wave_adaptive",
+                )
+            except Exception as _e:
+                print(f"[phases] eigenvector decomposition unavailable ({_e}); "
+                      "using irrep markers in the level panel")
+                eigvec_results = None
+        # retry any level the coarse scan could not classify (near-degenerate
+        # roots can hide one another at n_refine=800) with a much finer grid —
+        # only the missing levels, so the extra cost stays small
+        if eigvec_results is not None:
+            _got = {int(r["level_idx"]) for r in eigvec_results}
+            _missing = {i for i in range(len(data2cm)) if i not in _got}
+            if _missing:
+                # rerun the full (mom, irrep) blocks containing the missing
+                # levels so near-degenerate sibling roots keep their ordering
+                _keys = {(tuple(np.asarray(kept_mom2[i]).tolist()),
+                          kept_irreps[i]) for i in _missing}
+                _sub = [i for i in range(len(data2cm))
+                        if (tuple(np.asarray(kept_mom2[i]).tolist()),
+                            kept_irreps[i]) in _keys]
+                print(f"[phases] pies: retrying unclassified level(s) "
+                      f"{sorted(_missing)} at n_refine=6000 "
+                      f"(rescanning {len(_sub)} levels in {len(_keys)} irrep block(s))")
+                try:
+                    _retry = eigenvector_decomposition(
+                        par,
+                        [data2cm[i] for i in _sub],
+                        [kept_mom2[i] for i in _sub],
+                        [kept_irreps[i] for i in _sub],
+                        [kept_levels[i] for i in _sub],
+                        mL, MN, MK, n_refine=6000, step_mode="wave_adaptive",
+                    )
+                    for r in _retry:
+                        r["level_idx"] = _sub[int(r["level_idx"])]
+                    eigvec_results = (list(eigvec_results)
+                                      + [r for r in _retry
+                                         if int(r["level_idx"]) in _missing])
+                except Exception as _e:
+                    print(f"[phases] pies: fine-scan retry failed ({_e})")
+        for r in (eigvec_results or []):
+            if r.get("at_solution", True):
+                # slope-participation content (|v·(dΩ/dE·v)| — which wave's
+                # energy dependence drives the root); raw |v|² only as a
+                # fallback for precomputed old-format results
+                _w = r.get("weights_slope")
+                if _w is None:
+                    _w = r.get("weights_sens")
+                if _w is None:
+                    _w = r["weights"]
+                _pie_by_idx[int(r["level_idx"])] = np.asarray(_w, dtype=float)
+
+    _pie_wave_colors = None
+    if _pie_by_idx:
+        _winfo = _get_active_wave_info()
+        _pie_wave_colors = [
+            _wave_color_map.get((int(w["twoS"]), int(w["L"]), int(w["twoJ"])),
+                                f"C{k}")
+            for k, w in enumerate(_winfo)
+        ]
+
+    # ── y-offsets so overlapping circles stack instead of hiding each other ──
+    # Greedy slot assignment in x-order: a level goes to the first row (0, +1,
+    # −1, +2, …) whose previous occupant is more than one pie diameter away.
+    # y is measured in points (1 data unit = 1 pt once the ylim below is set):
+    # the panel is then shrunk to just wrap the occupied rows, so the pies
+    # fill it instead of floating in empty space (the freed height goes to
+    # the phase-shift panel).
+    _ecm_all = np.array([float(np.asarray(e, dtype=float)[0]) for e in data2cm])
+    _y_off   = np.zeros(len(_ecm_all))
+    _pie_d_pts = np.sqrt(float(pie_size))              # scatter s ≈ diameter²
+    _pie_ylim  = None
+    _lbl_dy    = 7.0                                   # level-label offset (pts)
+    if _pie_by_idx:
+        try:
+            _bb       = ax_bot.get_position()
+            _ax_w_pts = fig.get_size_inches()[0] * 72.0 * _bb.width
+        except Exception:
+            _ax_w_pts = 560.0
+        # 1.15 let neighbouring pies touch; 1.45 leaves a clear gap.  More
+        # slots so a dense cluster stacks further out instead of wrapping
+        # back onto an occupied row.
+        _dx_min  = (ecm_hi - ecm_lo) * (_pie_d_pts * 1.45) / max(_ax_w_pts, 1.0)
+        _slots   = [0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5]
+        _last_x  = {}
+        _slot_of = np.zeros(len(_ecm_all), dtype=int)
+        for _i in np.argsort(_ecm_all):
+            for _s in _slots:
+                if _s not in _last_x or (_ecm_all[_i] - _last_x[_s]) >= _dx_min:
+                    _slot_of[_i] = _s
+                    _last_x[_s]  = _ecm_all[_i]
+                    break
+        _row_pts = _pie_d_pts * 1.25                   # row separation (pts)
+        _y_off   = _slot_of * _row_pts
+        _lbl_dy  = 0.5 * _pie_d_pts + 2.0
+        # tight y-window: half a pie + a little air below, label headroom above
+        _pie_ylim = (_y_off.min() - 0.5 * _pie_d_pts - 5.0,
+                     _y_off.max() + 0.5 * _pie_d_pts + _lbl_dy + 11.0)
+        # re-split the two panels so the bottom one is exactly the window
+        # height (clamped to [1/8, 1/2] of the combined axes height); the sum
+        # of the two heights is preserved, so 1 y-data-unit ≈ 1 point
+        try:
+            _fig_h_pts = fig.get_size_inches()[1] * 72.0
+            _tot_pts   = (ax_top.get_position().height
+                          + ax_bot.get_position().height) * _fig_h_pts
+            _need_pts  = float(_pie_ylim[1] - _pie_ylim[0])
+            _bot_pts   = float(np.clip(_need_pts, _tot_pts / 8.0, _tot_pts / 2.0))
+            ax_bot.get_gridspec().set_height_ratios(
+                [_tot_pts - _bot_pts, _bot_pts])
+        except Exception:
+            pass
+
+    _labeled_combos = set()
     for idx, (ecm_samples, mom, irrep) in enumerate(
             zip(data2cm, kept_mom2, kept_irreps)):
         ecm_arr = np.asarray(ecm_samples, dtype=float)
         ecm_c   = float(ecm_arr[0])
         ecm_err = float(np.std(ecm_arr[1:])) if len(ecm_arr) > 1 else 0.0
-        key     = (tuple(np.asarray(mom).tolist()), irrep)
-        ci      = combo_key_map.get(key, 0)
-        color   = combo_colors[ci]
-        mkr     = combo_markers.get(key, "o")
         lv      = int(kept_levels[idx])
-        ax_bot.errorbar(
-            ecm_c, 0.0, xerr=ecm_err,
-            fmt=mkr, color=color, ms=7, lw=1.5,
-            capsize=4, capthick=1.2,
-            markeredgecolor="black", markeredgewidth=0.6,
-            zorder=10,
-            label=f"{_format_irrep_label(irrep)}(P²={int(np.sum(np.asarray(mom)**2))})"
-                  if idx == combo_key_map.get(key, -1) else None,
-        )
-        ax_bot.annotate(
-            str(lv),
-            xy=(ecm_c, 0.0), xytext=(0, 7),
-            textcoords="offset points",
-            ha="center", fontsize=7, color="black",
-        )
+        y0      = float(_y_off[idx])
+        if _pie_by_idx and idx in _pie_by_idx:
+            # error bar beneath, then a true pie chart: Wedge patches drawn
+            # through a point-radius transform anchored on the data point, so
+            # every slice converges exactly at the circle centre whatever the
+            # axes aspect (the old scatter-marker recipe re-normalised each
+            # wedge to its own bounding box, which off-centred small slices)
+            ax_bot.errorbar(ecm_c, y0, xerr=ecm_err, fmt="none",
+                            ecolor="black", elinewidth=1.2,
+                            capsize=4, capthick=1.2, zorder=8)
+            _tr = (fig.dpi_scale_trans
+                   + mtransforms.ScaledTranslation(ecm_c, y0, ax_bot.transData))
+            _r_in = 0.5 * _pie_d_pts / 72.0            # radius in inches
+            fracs = _pie_by_idx[idx]
+            t0 = 0.0
+            for k, fr in enumerate(fracs):
+                if fr <= 0.005:
+                    t0 += fr
+                    continue
+                # clockwise from 12 o'clock, like a standard pie chart
+                ax_bot.add_patch(mpatches.Wedge(
+                    (0.0, 0.0), _r_in,
+                    90.0 - 360.0 * (t0 + fr), 90.0 - 360.0 * t0,
+                    facecolor=_pie_wave_colors[k], edgecolor="none",
+                    transform=_tr, zorder=10))
+                t0 += fr
+            ax_bot.add_patch(mpatches.Circle(
+                (0.0, 0.0), _r_in, facecolor="none", edgecolor="black",
+                linewidth=0.6, transform=_tr, zorder=11))
+        elif _pie_by_idx:
+            # pies active but this level was not classified (no QC root /
+            # not at solution): hollow circle so it stands out
+            ax_bot.errorbar(ecm_c, y0, xerr=ecm_err, fmt="o",
+                            color="black", markerfacecolor="white",
+                            ms=7, lw=1.5, capsize=4, capthick=1.2,
+                            markeredgecolor="black", markeredgewidth=0.6,
+                            zorder=10)
+        else:
+            key   = (tuple(np.asarray(mom).tolist()), irrep)
+            ci    = combo_key_map.get(key, 0)
+            color = combo_colors[ci]
+            mkr   = combo_markers.get(key, "o")
+            _lbl = None
+            if key not in _labeled_combos:
+                _labeled_combos.add(key)
+                _lbl = f"{_format_irrep_label(irrep)}(P²={int(np.sum(np.asarray(mom)**2))})"
+            ax_bot.errorbar(
+                ecm_c, 0.0, xerr=ecm_err,
+                fmt=mkr, color=color, ms=7, lw=1.5,
+                capsize=4, capthick=1.2,
+                markeredgecolor="black", markeredgewidth=0.6,
+                zorder=10,
+                label=_lbl,
+            )
+        if show_level_labels:
+            ax_bot.annotate(
+                str(lv),
+                xy=(ecm_c, y0), xytext=(0, _lbl_dy),
+                textcoords="offset points",
+                ha="center", fontsize=9, color="black",
+            )
 
-    # deduplicated legend for combos
-    handles, labels_leg = ax_bot.get_legend_handles_labels()
-    seen_leg = {}
-    h_uniq, l_uniq = [], []
-    for h, lb in zip(handles, labels_leg):
-        if lb and lb not in seen_leg:
-            seen_leg[lb] = True
-            h_uniq.append(h); l_uniq.append(lb)
-    if h_uniq:
-        ax_bot.legend(h_uniq, l_uniq, loc="upper left",
-                      fontsize="x-small", frameon=True, ncol=2)
+    # deduplicated legend for combos (irrep-marker mode only — in pie mode the
+    # top-panel wave legend is the single colour key)
+    if not _pie_by_idx:
+        handles, labels_leg = ax_bot.get_legend_handles_labels()
+        seen_leg = {}
+        h_uniq, l_uniq = [], []
+        for h, lb in zip(handles, labels_leg):
+            if lb and lb not in seen_leg:
+                seen_leg[lb] = True
+                h_uniq.append(h); l_uniq.append(lb)
+        if h_uniq:
+            ax_bot.legend(h_uniq, l_uniq, loc="upper left",
+                          fontsize="x-small", frameon=True, ncol=2)
 
-    ax_bot.set_ylim(-0.5, 0.5)
-    ax_bot.set_xlabel(r"$E^*/m_N$")
+    if _pie_ylim is not None:
+        ax_bot.set_ylim(*_pie_ylim)
+    else:
+        ax_bot.set_ylim(-0.5, 0.5)
+    ax_bot.set_xlabel(r"$E^*/m_N$", fontsize=_lbl_fs)
     ax_bot.set_xlim(ecm_lo, ecm_hi)
 
     fig.align_ylabels([ax_top, ax_bot])
@@ -3564,7 +5099,7 @@ def plot_phase_shifts_multichannel(
     return fig, (ax_top, ax_bot)
 
 
-def plot_fit_comparison(
+def plot_luscher(
     fits,
     data2cm,
     kept_mom2,
@@ -3586,6 +5121,7 @@ def plot_fit_comparison(
     frames_all=None,
     irreps_all=None,
     levels_all=None,
+    show_level_labels=False,   # integer level index next to each point
 ):
     """
     Plot multiple K^{-1} fits overlaid on the same QC plot for comparison.
@@ -3703,16 +5239,18 @@ def plot_fit_comparison(
     default_colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
                       '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
     
-    # pre-compute chi2/dof for each fit if covariance data is provided
+    # chi2/dof per fit: prefer a precomputed fit_spec["chi2_dof"] (the runner
+    # passes its own converged value — recomputing here with default scan
+    # settings need not match the fit's observable/mode convention)
     fit_chi2_dof = []
-    if cov is not None and data_central is not None and frames_all is not None:
-        cov_arr = np.asarray(cov, dtype=float)
-        data_arr = np.asarray(data_central, dtype=float)
-        n_data = len(data_arr)
-        for fit_spec in fits:
+    for fit_spec in fits:
+        if fit_spec.get('chi2_dof') is not None:
+            fit_chi2_dof.append(float(fit_spec['chi2_dof']))
+        elif cov is not None and data_central is not None and frames_all is not None:
+            cov_arr = np.asarray(cov, dtype=float)
+            data_arr = np.asarray(data_central, dtype=float)
             params = np.asarray(fit_spec['params'], dtype=float)
-            n_par = len(params)
-            dof = n_data - n_par
+            dof = len(data_arr) - len(params)
             try:
                 chi2_val = _chi2(
                     params, data_arr,
@@ -3723,8 +5261,8 @@ def plot_fit_comparison(
                 fit_chi2_dof.append(chi2_val / dof if dof > 0 else float('nan'))
             except Exception:
                 fit_chi2_dof.append(float('nan'))
-    else:
-        fit_chi2_dof = [None] * len(fits)
+        else:
+            fit_chi2_dof.append(None)
 
     # plot each fit curve
     fit_lines = []
@@ -3741,15 +5279,15 @@ def plot_fit_comparison(
             label = fr"{label}  ($\chi^2$/dof = {chi2_dof:.2f})"
         
         model_kinv = _eval_kinv(params, ecm_sweep)
-        
+
         # mask poles
         pole_mask = np.abs(model_kinv) > clip
         model_kinv[pole_mask] = np.nan
-        
+
         diffs = np.abs(np.diff(np.where(np.isfinite(model_kinv), model_kinv, 0.0)))
         for jj in np.where(diffs > clip * 0.3)[0]:
             model_kinv[jj] = model_kinv[jj + 1] = np.nan
-        
+
         line, = ax.plot(
             p2_sweep, model_kinv,
             color=color, lw=linewidth, ls=linestyle,
@@ -3757,19 +5295,75 @@ def plot_fit_comparison(
         )
         fit_lines.append(line)
         fit_colors.append(color)
+
+        # ── ±1σ68 band from parameter samples: fit_spec['par_samples']
+        # (bootstrap, preferred) or Gaussian draws from fit_spec['vij'].
+        _draws = fit_spec.get('par_samples')
+        if _draws is None and fit_spec.get('vij') is not None:
+            _vij_arr = np.asarray(fit_spec['vij'], dtype=float)
+            if (_vij_arr.ndim == 2
+                    and _vij_arr.shape[0] == _vij_arr.shape[1] == len(params)):
+                try:
+                    _draws = np.random.default_rng(0).multivariate_normal(
+                        params, _vij_arr,
+                        int(fit_spec.get('n_par_samples', 200)))
+                except Exception:
+                    _draws = None
+        if _draws is not None and len(_draws):
+            _draws = np.asarray(_draws, dtype=float)
+            _nmax = int(fit_spec.get('n_par_samples', 200))
+            if _draws.shape[0] > _nmax:
+                _sel = np.random.default_rng(1).choice(
+                    _draws.shape[0], _nmax, replace=False)
+                _draws = _draws[_sel]
+            _curves = np.array([_eval_kinv(dp, ecm_sweep) for dp in _draws])
+            _curves[np.abs(_curves) > clip] = np.nan
+            _lo, _hi = np.nanpercentile(_curves, [16, 84], axis=0)
+            _band_bad = ~(np.isfinite(_lo) & np.isfinite(_hi)
+                          & np.isfinite(model_kinv))
+            _lo[_band_bad] = np.nan
+            _hi[_band_bad] = np.nan
+            ax.fill_between(p2_sweep, _lo, _hi, color=color,
+                            alpha=0.18, lw=0, zorder=4)
     
-    # BoxQuantization factory
+    # BoxQuantization factory (same construction as plot_quantization_condition;
+    # data points only need the box matrix, the K-matrix is just a placeholder
+    # built from the first fit's params)
+    _bq_max_L = 0
+    for ch in qn_channels:
+        if ch["enabled"]:
+            lv = ch.get("L_values")
+            if lv is not None:
+                for v in lv:
+                    _bq_max_L = max(_bq_max_L, int(v))
+            else:
+                _bq_max_L = max(_bq_max_L, int(ch.get("L", 0)))
+    _bq_par = np.asarray(fits[0]['params'], dtype=float)
+    _bq_cache_local = {}
+
     def _make_box_q_local(psq, irrep):
+        key = (psq, irrep)
+        if key in _bq_cache_local:
+            return _bq_cache_local[key]
         frame_label = _frame_label_from_psq(psq)
-        rep = str(irrep) if not isinstance(irrep, int) else ""
-        return BMat.BoxQuantization(
-            L=mL, irrep=rep, psq=psq,
-            Mref1=MN, Mref2=MK,
-            frame=frame_label
+
+        def _calc(J, Lp, Sp, chanp, L, S, chan, Ecm, pSqF):
+            return calcFunc_param(J, Lp, Sp, chanp, L, S, chan,
+                                  Ecm, pSqF, MN, MK, *_bq_par)
+
+        kinv_bq = BMat.KMatrix(_calc, isZero)
+        chan_list = [BMat.DecayChannelInfo("n", "n", 1, 1, True, True)]
+        box_q = BMat.BoxQuantization(
+            frame_label, psq, irrep, chan_list, [_bq_max_L + 1], kinv_bq, True
         )
+        box_q.setRefMassL(mL)
+        box_q.setMassesOverRef(0, MN, MK)
+        _bq_cache_local[key] = box_q
+        return box_q
     
     # plot data points
     y_vals_data = []
+    n_straddle = 0
     for i_dat, (ecm_samples, mom, irrep, level_idx) in enumerate(
         zip(data2cm, kept_mom2, kept_irreps, kept_levels)
     ):
@@ -3781,37 +5375,56 @@ def plot_fit_comparison(
         marker = irrep_marker_map[key]
         color  = level_colors_list[int(level_idx) % len(level_colors_list)]
         
-        # Convert to q-cot-delta
+        # Convert to q-cot-delta (diagonal box-matrix element of the first wave)
         try:
             box_q = _make_box_q_local(int(np.sum(mom**2)), irrep)
             b_central = float(np.real(
-                box_q.getmatBsubmatrix_fromlatticeE2(ecm_central**2)[0, 0]
+                box_q.getBoxMatrixFromEcm(ecm_central, 0, 0)
             ))
         except Exception:
             continue
-        
-        # error bars from bootstrap
+
+        # error bars from bootstrap.
+        #
+        # E -> B(0,0) is the Lüscher zeta map, which has a pole at every
+        # non-interacting level. A level sitting close to such a wall has a
+        # near-singular Jacobian: its bootstrap cloud in B is strongly
+        # asymmetric and may straddle the pole entirely. A symmetric sdev is
+        # meaningless there (it can render a point that is in fact totally
+        # unconstrained as a tight bar sitting far off the curve), so use
+        # 16/84 percentiles and mark straddlers as unconstrained.
+        drawn = False
         if show_errorbars and len(ecm_samples) > 1:
             b_boots = []
             for ecm_b in ecm_samples[1:]:
                 try:
                     b_boots.append(float(np.real(
-                        box_q.getmatBsubmatrix_fromlatticeE2(ecm_b**2)[0, 0]
+                        box_q.getBoxMatrixFromEcm(float(ecm_b), 0, 0)
                     )))
                 except Exception:
                     pass
             if b_boots:
-                b_boots = np.array(b_boots)
-                b_lo = float(gv.sdev(gv.dataset.avg_data(b_boots, bstrap=True)))
+                b_boots = np.array(b_boots, dtype=float)
+                b_16, b_84 = np.percentile(b_boots, [16.0, 84.0])
+                # cloud spanning more than the plotted scale has jumped a pole
+                straddles = bool(np.ptp(b_boots) > clip)
+                yerr = np.array([[max(b_central - b_16, 0.0)],
+                                 [max(b_84 - b_central, 0.0)]])
                 ax.errorbar(
                     p2_central, b_central,
-                    yerr=b_lo,
-                    fmt=marker, color=color,
+                    yerr=yerr,
+                    fmt=marker,
+                    color=color,
+                    markerfacecolor=("none" if straddles else color),
                     markersize=8, capsize=4, capthick=1.0,
-                    markeredgecolor="black", markeredgewidth=0.8,
-                    zorder=10
+                    markeredgecolor=("dimgray" if straddles else "black"),
+                    markeredgewidth=0.8,
+                    alpha=(0.55 if straddles else 1.0),
+                    zorder=(8 if straddles else 10),
                 )
-        else:
+                n_straddle += int(straddles)
+                drawn = True
+        if not drawn:
             ax.plot(
                 p2_central, b_central,
                 marker=marker, color=color,
@@ -3823,12 +5436,13 @@ def plot_fit_comparison(
         y_vals_data.append(b_central)
         
         # level annotation
-        ax.annotate(
-            str(int(level_idx)),
-            xy=(p2_central, b_central),
-            xytext=(4, 0), textcoords="offset points",
-            fontsize=8, color="dimgray", fontweight="bold"
-        )
+        if show_level_labels:
+            ax.annotate(
+                str(int(level_idx)),
+                xy=(p2_central, b_central),
+                xytext=(4, 0), textcoords="offset points",
+                fontsize=8, color="dimgray", fontweight="bold"
+            )
     
     # axes setup
     all_p2 = [float(e[0]) ** 2 / 4.0 - 1.0 for e in data2cm]
@@ -3899,7 +5513,14 @@ def plot_fit_comparison(
     ax.grid(True, alpha=0.2, linestyle=":")
     
     # legend for fits — color each label text to match its fit band
-    leg = ax.legend(handles=fit_lines, loc='best', fontsize=11, frameon=True,
+    leg_handles = list(fit_lines)
+    if n_straddle:
+        leg_handles.append(mlines.Line2D(
+            [], [], marker="o", linestyle="None", markerfacecolor="none",
+            markeredgecolor="dimgray", markersize=8, alpha=0.55,
+            label=(rf"near free-level wall: $p^\star\!\cot\delta$ "
+                   rf"unconstrained ({n_straddle}/{len(y_vals_data)})")))
+    leg = ax.legend(handles=leg_handles, loc='best', fontsize=11, frameon=True,
                     framealpha=0.9, edgecolor='lightgray')
     for text, color in zip(leg.get_texts(), fit_colors):
         text.set_color(color)
@@ -3913,6 +5534,11 @@ def plot_fit_comparison(
         plt.show()
     plt.close(fig)
     return fig, ax
+
+
+# back-compat: this figure was called "fit_comparison" before it was renamed
+# to "luscher".
+plot_fit_comparison = plot_luscher
 
 
 def plot_chi2_landscape(
@@ -4713,16 +6339,30 @@ def plot_omega_and_eigenvalues(
     # NI positions for masking — use central mL
     ni_mask_arr = np.array([ecm_c for ecm_c, _, _ in ni_vlines]) if ni_vlines else np.array([])
 
-    def _mask_near_ni(vals):
-        """Set a minimal NaN gap only at NI poles to avoid drawing through singular points."""
-        out = vals.copy()
-        if ni_mask_arr.size == 0:
-            return out
-
-        # Leave nearby structure visible: only mask the sweep point closest to each NI pole.
+    # ── NI-aware sweep refinement ─────────────────────────────────────────────
+    # Eigenvalue branches swing steeply and jump discontinuously at the NI
+    # poles; a uniform grid aliases that structure. Flank every pole with
+    # geometric point stacks (down to 1e-6 of the range) and put a NaN
+    # sentinel exactly AT each pole so no line segment can be drawn across
+    # the discontinuity.
+    if ni_mask_arr.size:
+        span = (ecm_max_ - ecm_min_) or 1.0
+        offs = span * np.geomspace(1e-6, 8e-3, 14)
+        stacks = [ecm_sweep]
         for ni in ni_mask_arr:
-            idx = int(np.argmin(np.abs(ecm_sweep - ni)))
-            out[idx] = np.nan
+            for sgn in (-1.0, 1.0):
+                pts = ni + sgn * offs
+                stacks.append(pts[(pts > ecm_min_) & (pts < ecm_max_)])
+        ecm_sweep = np.unique(np.concatenate(stacks))
+        ecm_sweep = np.sort(np.concatenate([ecm_sweep, ni_mask_arr]))
+        pole_sentinel = np.isin(ecm_sweep, ni_mask_arr)
+    else:
+        pole_sentinel = np.zeros(len(ecm_sweep), dtype=bool)
+
+    def _mask_near_ni(vals):
+        """NaN exactly at the NI poles so curves break instead of connecting."""
+        out = vals.copy()
+        out[pole_sentinel] = np.nan
         return out
 
     for mom, irrep in combos:
@@ -4742,7 +6382,11 @@ def plot_omega_and_eigenvalues(
 
         omega_vals = []
         eig_vals   = []
-        for ecm in ecm_sweep:
+        for i_e, ecm in enumerate(ecm_sweep):
+            if pole_sentinel[i_e]:      # exact NI pole: forced line break
+                omega_vals.append(np.nan)
+                eig_vals.append(None)
+                continue
             try:
                 omega_vals.append(box_q.getOmegaFromEcm(1.0, float(ecm)))
             except Exception:
@@ -4771,9 +6415,15 @@ def plot_omega_and_eigenvalues(
             if ev is not None and len(ev) == n_eigs:
                 eig_array[i] = ev
 
-        # mask NI discontinuities per eigenvalue
-        for j in range(n_eigs):
-            eig_array[:, j] = _mask_near_ni(eig_array[:, j])
+        # ── Regularize: λ → λ/√(μ²+λ²) ─────────────────────────────────────
+        # Maps [-∞,+∞] → [-1,+1].  Zero crossings (QC solutions) are preserved
+        # exactly.  Near-NI poles saturate to ±1 instead of diverging, so the
+        # plot scale is driven by the physics (variation near zero) not by poles.
+        # μ = 10% of the median |λ| across non-NI regions — auto-scales to the
+        # typical eigenvalue magnitude for this system.
+        _finite = eig_array[np.isfinite(eig_array)]
+        _mu = max(float(np.percentile(np.abs(_finite), 50)) * 0.1, 1e-3) if len(_finite) else 0.1
+        eig_array = eig_array / np.sqrt(_mu**2 + eig_array**2)
 
         combo_eigs[key] = eig_array
     # ── auto ylim helper (shared by Omega and eigenvalue panels) ─────────────
@@ -4827,18 +6477,19 @@ def plot_omega_and_eigenvalues(
     _ncol = min(_n_combos, max(1, (_n_combos + 1) // 2))   # at most 2 rows
     ax_omega.legend(loc="lower center", ncol=_ncol, frameon=True,
                     fontsize="small", columnspacing=0.8, handlelength=1.2)
-    # ── Panel b+: eigenvalues ─────────────────────────────────────────────────
+    # ── Panel b+: eigenvalues (regularised λ/√(μ²+λ²)) ─────────────────────
     if show_lambda_panels:
         for j in range(n_eigs_global):
             ax  = axes[1 + j]
-            lim = eig_lims[j] if j < len(eig_lims) else eig_ylim[1]
             _draw_ni_lines(ax)
-            ax.axhline(0, color="gray", ls="--", lw=1)
-            ax.set_ylim(-lim, lim)
-            ax.set_yticks([0.0])
+            ax.axhline(0,    color="gray", ls="--", lw=1)
+            ax.axhline( 1.0, color="gray", ls=":",  lw=0.6, alpha=0.5)
+            ax.axhline(-1.0, color="gray", ls=":",  lw=0.6, alpha=0.5)
+            ax.set_ylim(-1.15, 1.15)
+            ax.set_yticks([-1, 0, 1])
 
             wave_str = config_wave_labels[j] if j < len(config_wave_labels) else f"wave {j+1}"
-            ax.set_ylabel(rf"$\lambda_{{{j+1}}}$ {wave_str}")
+            ax.set_ylabel(rf"$\tilde{{\lambda}}_{{{j+1}}}$ {wave_str}", fontsize="small")
 
             for ci, (mom, irrep) in enumerate(combos):
                 key       = (tuple(mom.tolist()), irrep)
@@ -4927,12 +6578,22 @@ def plot_omega_and_eigenvalues(
         )
         data_plotted = True
 
-    # predicted levels
+    # predicted levels — edge-stacked QC roots via predict_energy_cm_dict
+    # (the serial _model_datap2 grid scan skips near-degenerate roots hugging
+    # the NI walls and cascades every level up to the next root)
     try:
-        p2_all  = _model_datap2(par, frames_g, irreps_g, levels_g, mL, MN, MK, n=n_refine,
-                                data2cm=data2cm, kept_mom2=kept_mom2, kept_irreps=kept_irreps,
-                                step_mode=step_mode, n_refine=n_refine, mN_err=mN_err)
-        ecm_all = 2.0 * np.sqrt(np.asarray(p2_all, dtype=float) + 1.0)
+        pred_dict = predict_energy_cm_dict(
+            par, data2cm, kept_mom2, kept_irreps, kept_levels,
+            mL, MN, MK, n_refine=n_refine, step_mode=step_mode)
+        ecm_all = np.full(len(kept_mom2), np.nan)
+        for k in range(len(kept_mom2)):
+            mom_k = np.asarray(kept_mom2[k]).ravel()
+            psq_k = int(np.sum(mom_k ** 2))
+            v = (pred_dict.get(f"PSQ{psq_k}", {})
+                 .get(str(kept_irreps[k]), {})
+                 .get(int(kept_levels[k]), []))
+            if v:
+                ecm_all[k] = float(v[0])
         n_pred  = len(ecm_all)                              # ← anchor expected size
 
         # Predicted-level uncertainty propagation is intentionally disabled
@@ -4940,6 +6601,8 @@ def plot_omega_and_eigenvalues(
         pred_plotted = False
         for k in range(n_pred):
             pred_e = float(ecm_all[k])
+            if not np.isfinite(pred_e):
+                continue
             mom_k  = np.asarray(kept_mom2[k]).ravel()
             irr_k  = kept_irreps[k]
             key_k  = (tuple(mom_k.tolist()), irr_k)
@@ -5089,29 +6752,99 @@ def _get_active_wave_info():
     return waves
 
 
+def _get_bmat_basis(box_q):
+    """
+    QC-matrix row labels read directly from BMat, in exact row order.
+
+    Uses the getBasisStates binding (pythib_jo BMatrix.cc): each basis state
+    is (channel, 2S, 2J, L, occurrence), and BMat fills B and K̃⁻¹ by
+    iterating this set with a row counter, so element i here IS row i of
+    getBoxMatrixFromEcm / getKtilde*FromEcm.  Returns None with an older .so
+    that lacks the binding — callers then fall back to the config-order
+    assumption of _get_active_wave_info().
+    """
+    if not hasattr(box_q, "getBasisStates"):
+        return None
+    _L_LABELS = {0: "S", 1: "P", 2: "D", 3: "F", 4: "G", 5: "H"}
+    basis = []
+    for chan, twoS, twoJ, L, occ in box_q.getBasisStates():
+        L_str = _L_LABELS.get(int(L), f"L{L}")
+        label = rf"${{}}^{{{int(twoS) + 1}}}{L_str}_{{{int(twoJ) // 2}}}$"
+        if int(occ) > 1:
+            label += f" (occ {int(occ)})"
+        basis.append({"chan": int(chan), "twoS": int(twoS), "twoJ": int(twoJ),
+                      "L": int(L), "occ": int(occ), "label": label})
+    return basis
+
+
 def eigenvector_decomposition(
     par,
     data2cm,
     kept_mom2,
     kept_irreps,
+    kept_levels,
     mL,
     MN,
     MK,
     eps=1e-3,
     n_refine=100,
-    step_mode="adaptive",
+    step_mode="fast",
+    method="eigh",
+    sol_quality_warn=0.1,
 ):
     """
-    Compute the QC null-eigenvector composition for every fitted energy level.
+    Compute the QC null-eigenvector wave decomposition for every fitted level.
 
-    At each QC solution E*, the Luscher matrix is Omega = B(E*) - K^-1(E*).
-    det(Omega) = 0 means the smallest singular value is ~0 and the corresponding
-    right singular vector (Vh[-1] from SVD) is the null eigenvector.
-    |v_i|^2 gives the fractional coupling of the level to wave i.
+    At a QC solution E*, Omega = B(E*) - K^{-1}(E*) has one eigenvalue near 0.
+    The eigenvector for that eigenvalue gives the wave content: |v_i|^2 is the
+    fractional weight of partial wave i.
 
-    Returns list of dict per QC solution with keys:
-        mom, irrep, level_idx, Ecm, wave_labels, weights,
-        eigenvector, singular_values, dominant_wave, dominant_idx
+    Approach
+    --------
+    B is read directly from BMat (dummy K=0 BoxQuantization, pure kinematics).
+    K^{-1} is computed directly from calcFunc_param with the fit parameters —
+    no recording trick needed since we already have par.  pSqF=[] causes
+    _extract_p2 to use Ecm^2/4 - 1, which is the correct CM momentum for any
+    frame (K^{-1} is Lorentz-scalar).
+
+    ORIGINAL APPROACH (kept for reference):
+    ----------------------------------------
+    # The original code used a "recording" BoxQuantization that intercepted
+    # every K^{-1} call made by BMat and cached the values in _kinv_store:
+    #
+    #   _kinv_store = {}
+    #   def _recording_cf(J, Lp, Sp, chanp, L, S, chan, Ecm, pSqF,
+    #                     _par=par, _store=_kinv_store):
+    #       val = float(calcFunc_param(
+    #           J, Lp, Sp, chanp, L, S, chan, Ecm, pSqF, MN, MK, *_par
+    #       ))
+    #       _store[(int(J),int(Lp),int(Sp),int(chanp),int(L),int(S),int(chan))] = val
+    #       return val
+    #   kinv_rec = BMat.KMatrix(_recording_cf, isZero)
+    #   box_q = BMat.BoxQuantization(frame_label, psq, irrep, chan_list,
+    #                                [bmat_max_L], kinv_rec, True)
+    #   ...
+    #   # Then at each E* trigger the cache:
+    #   _ = box_q.getEigenvaluesFromEcm(float(ecm_star))
+    #   # and read K^{-1}[i,j] from _kinv_store via key (J, Li, Si, 0, Lj, Sj, 0)
+    #
+    # This worked but was indirect — we already have par, so we can just call
+    # calcFunc_param ourselves.  The only subtlety is pSqF: when passed as [],
+    # _extract_p2 defaults to Ecm^2/4 - 1, matching BMat's internal CM momentum.
+
+    Critical notes
+    --------------
+    * eigh sorts eigenvalues ascending — index 0 is most NEGATIVE, not closest
+      to zero.  We always pick the column of smallest |eigenvalue|.
+    * Solution quality: at a true QC solution min|λ| << sol_quality_warn.
+    * SVD: numpy returns singular values descending, so smallest is s[-1]
+      and its right singular vector is Vh[-1].
+
+    Returns list of dicts per QC solution, keys:
+        mom, irrep, level, level_idx, Ecm,
+        wave_labels, weights, eigenvector,
+        eigenvalues, null_eigenvalue, null_idx,
+        dominant_wave, dominant_idx, at_solution
     """
     _require_bmat()
     par = np.asarray(par, dtype=float)
@@ -5124,21 +6857,20 @@ def eigenvector_decomposition(
 
     results = []
 
-    # group levels by unique (frame, irrep)
+    # ── group kept levels by (frame, irrep) ──────────────────────────────────
     seen_frame_irreps = {}
     for idx, (mom, irrep) in enumerate(zip(kept_mom2, kept_irreps)):
         key = (tuple(int(x) for x in np.asarray(mom).ravel()), irrep)
         seen_frame_irreps.setdefault(key, []).append(idx)
 
-    # max_L from active channels
+    # ── max_L from active channels ────────────────────────────────────────────
     qn_channels = _normalize_qn_channels()
     max_L_ch = 0
     for ch in qn_channels:
         if ch["enabled"]:
             lv = ch.get("L_values")
             if lv is not None:
-                for v in lv:
-                    max_L_ch = max(max_L_ch, int(v))
+                for v in lv: max_L_ch = max(max_L_ch, int(v))
             else:
                 max_L_ch = max(max_L_ch, int(ch.get("L", 0)))
     bmat_max_L = max_L_ch + 1
@@ -5146,8 +6878,8 @@ def eigenvector_decomposition(
     chan_list = [BMat.DecayChannelInfo("n", "n", 1, 1, True, True)]
 
     for (mom_tuple, irrep), level_indices in seen_frame_irreps.items():
-        mom    = np.array(mom_tuple, dtype=int)
-        psq    = int(np.sum(mom ** 2))
+        mom         = np.array(mom_tuple, dtype=int)
+        psq         = int(np.sum(mom ** 2))
         frame_label = _frame_label_from_psq(psq)
 
         data_ecm_this = [float(data2cm[i][0]) for i in level_indices]
@@ -5165,113 +6897,306 @@ def eigenvector_decomposition(
             step_mode=step_mode, n_refine=n_refine,
         )
         if not solutions:
-            _progress_log(f"[eigenvec]   No QC solutions found.")
+            _progress_log("[eigenvec]   No QC solutions found.")
             continue
 
-        # Build a recording BoxQuantization: intercepts every K^-1 call so
-        # we have the actual values without needing to pass pSqFuncList manually.
-        _kinv_store = {}   # (J, Lp, Sp, chanp, L, S, chan) -> float
+        # ── dummy BoxQuantization for B matrix only ───────────────────────────
+        # K=0 so only the kinematic B matrix is computed; K^{-1} comes from
+        # direct calcFunc_param calls below.
+        def _dummy_calc(J, Lp, Sp, chanp, L, S, chan, Ecm, pSqF):
+            return 0.0
 
-        def _recording_cf(J, Lp, Sp, chanp, L, S, chan, Ecm, pSqF,
-                           _par=par, _store=_kinv_store):
-            val = float(calcFunc_param(
-                J, Lp, Sp, chanp, L, S, chan, Ecm, pSqF, MN, MK, *_par
-            ))
-            _store[(int(J), int(Lp), int(Sp), int(chanp),
-                    int(L),  int(S),  int(chan))] = val
-            return val
-
-        kinv_rec = BMat.KMatrix(_recording_cf, isZero)
+        kinv_dummy = BMat.KMatrix(_dummy_calc, isZero)
         box_q = BMat.BoxQuantization(
-            frame_label, psq, irrep, chan_list, [bmat_max_L], kinv_rec, True
+            frame_label, psq, irrep, chan_list, [bmat_max_L], kinv_dummy, True
         )
         box_q.setRefMassL(mL)
         box_q.setMassesOverRef(0, MN, MK)
 
+        # ── QC row labels direct from BMat (None with older .so builds) ──────
+        # row_wave[i] = index into wave_info of the config wave that QC row i
+        # belongs to (occurrences ≥ 2 map to the same wave), or -1 if row i is
+        # not a configured wave.  Without the binding we fall back to the old
+        # assumption: rows 0..n_waves_cfg-1 are the config waves in order.
+        bmat_basis = _get_bmat_basis(box_q)
+        if bmat_basis is not None:
+            row_wave = [
+                next((k for k, w in enumerate(wave_info)
+                      if (w["twoJ"], w["L"], w["twoS"]) ==
+                         (b["twoJ"], b["L"], b["twoS"])), -1)
+                for b in bmat_basis
+            ]
+            _progress_log(
+                f"[eigenvec] BMat basis {irrep} PSq={psq} "
+                f"({len(bmat_basis)} rows): "
+                + ", ".join(f"row{i}={b['label']}"
+                            for i, b in enumerate(bmat_basis))
+            )
+            head_mismatch = [
+                iw for iw in range(min(n_waves_cfg, len(bmat_basis)))
+                if row_wave[iw] != iw
+            ]
+            if head_mismatch or len(bmat_basis) < n_waves_cfg:
+                _progress_log(
+                    "[eigenvec]   NOTE: BMat row order differs from config "
+                    f"order (rows {head_mismatch}) — using BMat labels."
+                )
+        else:
+            row_wave = list(range(n_waves_cfg))
+            _progress_log(
+                "[eigenvec] BMat basis unavailable (.so lacks getBasisStates)"
+                " — assuming config-order rows."
+            )
+
+        basis_probe_done = False
+        ev_list = []
+
+        def _build_BK(ecm):
+            """B and K^{-1} at ecm (same conventions as the docstring above:
+            B from BMat with a dummy K; K^{-1} from calcFunc_param with pSqF=[]
+            → Ecm²/4−1 CM momentum).  With bmat_basis available, rows follow
+            BMat's own basis (full size, incl. occurrence ≥ 2 states) and K̃⁻¹
+            uses BMat's exact rule from get_ktilde_matrix: nonzero only when
+            2J AND occurrence match, value independent of occurrence.  Without
+            it, falls back to config-order rows truncated at n_waves_cfg."""
+            if bmat_basis is not None:
+                nn = len(bmat_basis)
+            else:
+                nn = _get_bmat_size(box_q, float(ecm))
+            Bm = np.zeros((nn, nn), dtype=float)
+            for iw in range(nn):
+                for jw in range(nn):
+                    try:
+                        Bm[iw, jw] = float(np.real(
+                            box_q.getBoxMatrixFromEcm(float(ecm), iw, jw)
+                        ))
+                    except Exception:
+                        Bm[iw, jw] = 0.0
+            Km = np.zeros((nn, nn), dtype=float)
+            if bmat_basis is not None:
+                for iw in range(nn):
+                    for jw in range(nn):
+                        bi, bj = bmat_basis[iw], bmat_basis[jw]
+                        if bi["twoJ"] != bj["twoJ"] or bi["occ"] != bj["occ"]:
+                            continue
+                        try:
+                            Km[iw, jw] = float(calcFunc_param(
+                                bi["twoJ"],
+                                int(bj["L"]), bj["twoS"], 0,  # Lp, Sp, chanp (col)
+                                int(bi["L"]), bi["twoS"], 0,  # L,  S,  chan  (row)
+                                float(ecm), [], MN, MK, *par
+                            ))
+                        except Exception:
+                            Km[iw, jw] = 0.0
+            else:
+                for iw in range(min(nn, n_waves_cfg)):
+                    for jw in range(min(nn, n_waves_cfg)):
+                        wi, wj = wave_info[iw], wave_info[jw]
+                        if wi["twoJ"] != wj["twoJ"]:
+                            continue
+                        try:
+                            Km[iw, jw] = float(calcFunc_param(
+                                wi["twoJ"],
+                                int(wj["L"]), wj["twoS"], 0,   # Lp, Sp, chanp  (col)
+                                int(wi["L"]), wi["twoS"], 0,   # L,  S,  chan   (row)
+                                float(ecm), [], MN, MK, *par
+                            ))
+                        except Exception:
+                            Km[iw, jw] = 0.0
+            return Bm, Km
+
         for sol_idx, ecm_star in enumerate(solutions):
-            # Trigger K^-1 evaluation so _kinv_store is populated at this E*
-            _kinv_store.clear()
-            try:
-                _ = box_q.getEigenvaluesFromEcm(float(ecm_star))
-            except Exception as exc:
-                _progress_log(f"[eigenvec]   getEigenvaluesFromEcm failed: {exc}")
-                continue
 
-            n = _get_bmat_size(box_q, float(ecm_star))
+            n = (len(bmat_basis) if bmat_basis is not None
+                 else _get_bmat_size(box_q, float(ecm_star)))
+            B, Kinv   = _build_BK(ecm_star)
+            Omega     = B - Kinv
+            Omega_sym = (Omega + Omega.T) / 2
 
-            # Build Omega = B - K^-1 as an n x n real matrix
-            Omega = np.zeros((n, n), dtype=float)
-            for iw in range(n):
-                for jw in range(n):
-                    B_ij = float(np.real(
-                        box_q.getBoxMatrixFromEcm(float(ecm_star), iw, jw)
-                    ))
-                    kinv_ij = 0.0
-                    if iw < n_waves_cfg and jw < n_waves_cfg:
-                        wi = wave_info[iw]
-                        wj = wave_info[jw]
-                        J_i  = wi["twoJ"] // 2
-                        J_j  = wj["twoJ"] // 2
-                        L_i, S_i = int(wi["L"]), wi["twoS"] // 2
-                        L_j, S_j = int(wj["L"]), wj["twoS"] // 2
-                        if J_i == J_j:
-                            key_ij = (J_i, L_i, S_i, 0, L_j, S_j, 0)
-                            kinv_ij = _kinv_store.get(key_ij, 0.0)
-                    Omega[iw, jw] = B_ij - kinv_ij
+            # ── basis probe: print B, K^{-1}, Omega diagonal once per group ──
+            if not basis_probe_done:
+                basis_probe_done = True
+                _progress_log(
+                    f"[eigenvec] Basis probe {irrep} PSq={psq} at E*={ecm_star:.5f}:"
+                )
+                _progress_log("  iw   B[i,i]    K^-1[i,i]   Omega[i,i]   channel")
+                for iw in range(n):
+                    if bmat_basis is not None and iw < len(bmat_basis):
+                        label = bmat_basis[iw]["label"]
+                    elif iw < n_waves_cfg:
+                        label = wave_info[iw]["label"]
+                    else:
+                        label = "(extra BMat state)"
+                    _progress_log(
+                        f"  {iw}    {B[iw,iw]:+.4f}    {Kinv[iw,iw]:+.4f}"
+                        f"      {Omega[iw,iw]:+.4f}      {label}"
+                    )
+
+            # ── eigendecomposition ────────────────────────────────────────────
+            eigenvalues, eigenvectors = np.linalg.eigh(Omega_sym)
+            ev_list.append(eigenvalues)
+
+            # eigh sorts ascending: eigenvalues[0] is most NEGATIVE, not closest
+            # to zero.  The physical null mode is the one with smallest |λ|.
+            null_idx        = int(np.argmin(np.abs(eigenvalues)))
+            null_eigenvalue = float(eigenvalues[null_idx])
+            at_solution     = abs(null_eigenvalue) < sol_quality_warn
 
             _progress_log(
-                f"[eigenvec]   E*={ecm_star:.7f}  Omega({n}x{n}):\n"
-                + "\n".join(
-                    "    " + "  ".join(f"{Omega[i,j]:+.4e}" for j in range(n))
-                    for i in range(n)
+                f"[eigenvec]   sol {sol_idx}  E*={ecm_star:.6f}  eigenvalues: "
+                + "  ".join(
+                    f"λ{i}={v:+.5f}{'←null' if i == null_idx else ''}"
+                    for i, v in enumerate(eigenvalues)
                 )
             )
+            if not at_solution:
+                _progress_log(
+                    f"[eigenvec]   WARNING: min|λ|={abs(null_eigenvalue):.4f} "
+                    f">= {sol_quality_warn} — not at a QC solution; "
+                    "wave content unreliable."
+                )
+            else:
+                _progress_log(
+                    f"[eigenvec]   OK at solution: null λ{null_idx}={null_eigenvalue:.2e}"
+                )
 
-            # SVD: s[-1] ~ 0 is the null singular value; Vh[-1] is null vector
-            U, s, Vh = np.linalg.svd(Omega)
-            eigenvec = Vh[-1]
+            # ── select null vector ────────────────────────────────────────────
+            if method == "svd":
+                # numpy SVD returns singular values descending; smallest is s[-1]
+                # and its right singular vector is the last row of Vh.
+                _, s, Vh = np.linalg.svd(Omega)
+                eigenvec = Vh[-1]
+                _progress_log(
+                    "[eigenvec]   SVD singular values: "
+                    + "  ".join(f"σ{i}={v:.4f}" for i, v in enumerate(s))
+                    + f"  → Vh[-1]  σ_min={s[-1]:.2e}"
+                )
+            else:
+                # eigh: column null_idx (smallest |λ|), NOT column 0.
+                eigenvec = eigenvectors[:, null_idx]
+                _progress_log(
+                    f"[eigenvec]   eigh null vector col {null_idx}: "
+                    f"{np.array2string(eigenvec, precision=4)}"
+                )
 
-            _progress_log(
-                f"[eigenvec]   singular values: {np.array2string(s, precision=4)}"
-            )
-            _progress_log(
-                f"[eigenvec]   null vector Vh[-1]: "
-                f"{np.array2string(eigenvec, precision=4)}"
-            )
+            # ── wave weights ──────────────────────────────────────────────────
+            # Rows are aggregated onto config waves via row_wave (from the
+            # BMat basis when available): occurrence ≥ 2 rows add to the same
+            # wave; unconfigured rows (row_wave = -1) are dropped.  With the
+            # config-order fallback row_wave = [0..n_waves_cfg-1], identical
+            # to the old eigenvec[:n_waves_cfg] behaviour.
+            def _agg_rows(vals):
+                out = np.zeros(n_waves_cfg, dtype=float)
+                for iw in range(min(len(vals), len(row_wave))):
+                    k = row_wave[iw]
+                    if k >= 0:
+                        out[k] += vals[iw]
+                return out
 
-            # |v_i|^2 normalised to sum = 1
-            raw_w = eigenvec[:n_waves_cfg] ** 2
-            total = raw_w.sum()
+            raw_w  = _agg_rows(eigenvec ** 2)
+            total  = raw_w.sum()
             weights = raw_w / total if total > 1e-30 else np.ones(n_waves_cfg) / n_waves_cfg
+
+            # interaction-weighted content: v_i²·|K̃⁻¹_ii| — how much the level
+            # responds to a fractional change of each wave's interaction; this
+            # removes the arbitrary basis/barrier-factor row scaling of raw |v|²
+            kinv_diag = np.zeros(n_waves_cfg, dtype=float)
+            for iw in range(min(len(row_wave), Kinv.shape[0])):
+                k = row_wave[iw]
+                if k >= 0 and kinv_diag[k] == 0.0:
+                    kinv_diag[k] = Kinv[iw, iw]
+            raw_s     = raw_w * np.abs(kinv_diag)
+            total_s   = raw_s.sum()
+            weights_sens = (raw_s / total_s if total_s > 1e-30
+                            else np.ones(n_waves_cfg) / n_waves_cfg)
+
+            # slope-participation content: w_i ∝ |v_i (dΩ/dE v)_i| — each
+            # wave's share of the null eigenvalue's energy slope at the root,
+            # i.e. whose energy dependence drives this level through the QC.
+            # Invariant under diagonal rescalings of the basis (the barrier /
+            # K̃-magnitude scaling that makes raw |v|² misleading).
+            _hE = 5e-5
+            try:
+                Bp, Kp = _build_BK(ecm_star + _hE)
+                Bm, Km = _build_BK(ecm_star - _hE)
+                _n2 = min(Bp.shape[0], Bm.shape[0], n)
+                _Op = Bp - Kp; _Op = (_Op + _Op.T) / 2
+                _Om = Bm - Km; _Om = (_Om + _Om.T) / 2
+                dO  = (_Op[:_n2, :_n2] - _Om[:_n2, :_n2]) / (2 * _hE)
+                _v  = eigenvec[:_n2]
+                raw_f = _agg_rows(np.abs(_v * (dO @ _v)))
+                tot_f = raw_f.sum()
+                weights_slope = (raw_f / tot_f if tot_f > 1e-30
+                                 else weights.copy())
+                # "normalized |v|^2": each component weighted by its own
+                # row's energy-slope scale, |v_i|^2 |dOmega_ii/dE| — the
+                # diagonal part of the slope metric (no cross terms).
+                raw_n = _agg_rows((_v ** 2) * np.abs(np.diag(dO)))
+                tot_n = raw_n.sum()
+                weights_vsq_norm = (raw_n / tot_n if tot_n > 1e-30
+                                    else weights.copy())
+            except Exception:
+                weights_slope = weights.copy()
+                weights_vsq_norm = weights.copy()
 
             dom_idx = int(np.argmax(weights))
             level_data_idx = (
                 level_indices[sol_idx] if sol_idx < len(level_indices)
                 else level_indices[-1]
             )
+            actual_level = kept_levels[level_data_idx]
 
             for k, wv in enumerate(wave_info):
                 _progress_log(
                     f"[eigenvec]     wave {k} ({wv['label']:8s})  "
-                    f"|v|^2={weights[k]:.4f}  ({weights[k]*100:.1f}%)"
+                    f"|v|²={weights[k]:.4f}  ({weights[k]*100:.1f}%)"
                 )
             _progress_log(
-                f"[eigenvec]   -> dominant wave: {wave_info[dom_idx]['label']}  "
-                f"({weights[dom_idx]*100:.1f}%)"
+                f"[eigenvec]   -> dominant: {wave_info[dom_idx]['label']}  "
+                f"({weights[dom_idx]*100:.1f}%)  "
+                f"null |λ|={abs(null_eigenvalue):.2e}  "
+                f"{'[OK]' if at_solution else '[WARNING: not at solution]'}"
+            )
+
+            _dom_f = int(np.argmax(weights_slope))
+            _progress_log(
+                "[eigenvec]   slope-participation (|v·(dΩ/dE·v)|): "
+                + "  ".join(f"{wave_info[k]['label']}={weights_slope[k]*100:.1f}%"
+                            for k in range(n_waves_cfg))
+                + f"  -> {wave_info[_dom_f]['label']}"
             )
 
             results.append({
                 "mom":             mom_tuple,
                 "irrep":           irrep,
+                "level":           actual_level,
                 "level_idx":       level_data_idx,
                 "Ecm":             float(ecm_star),
                 "wave_labels":     [w["label"] for w in wave_info],
                 "weights":         weights,
+                "weights_sens":    weights_sens,
+                "weights_slope":   weights_slope,
+                "weights_vsq_norm": weights_vsq_norm,
+                "kinv_diag":       kinv_diag,
                 "eigenvector":     eigenvec[:n_waves_cfg],
-                "singular_values": s,
+                "eigenvector_full": eigenvec,
+                "bmat_basis":      bmat_basis,
+                "row_wave":        list(row_wave),
+                "eigenvalues":     eigenvalues,
+                "null_eigenvalue": null_eigenvalue,
+                "null_idx":        null_idx,
                 "dominant_wave":   wave_info[dom_idx]["label"],
                 "dominant_idx":    dom_idx,
+                "at_solution":     at_solution,
             })
+
+        if ev_list:
+            ev_arr = np.array(ev_list)
+            _progress_log(
+                f"[eigenvec] eigenvalue table {irrep} PSq={psq}  "
+                "(rows=solutions, cols=eigenvalues, ←null = smallest |λ|):\n"
+                + np.array2string(ev_arr, precision=6, suppress_small=False)
+            )
 
     return results
 
@@ -5291,18 +7216,19 @@ def print_eigenvector_decomposition(results, log_fn=None):
     wave_labels = results[0]["wave_labels"]
     n_waves = len(wave_labels)
     header_waves = "  ".join(f"{lbl:>12s}" for lbl in wave_labels)
-    sep = "-" * (50 + 14 * n_waves)
+    sep = "-" * (53 + 14 * n_waves)
     _out("")
     _out("=" * 60)
     _out("  QC Null-Eigenvector Wave Decomposition")
     _out("=" * 60)
-    _out(f"  {'irrep':>10s}  {'PSq':>4s}  {'E*/mN':>10s}  {header_waves}  dominant")
+    _out(f"  {'irrep(PSq)':>14s}  {'lv':>3s}  {'E*/mN':>10s}  {header_waves}  dominant")
     _out(sep)
-    for r in results:
-        psq = int(sum(x ** 2 for x in r["mom"]))
-        pct_strs = "  ".join(f"{w * 100:>11.1f}%" for w in r["weights"])
+    for idx, r in enumerate(results):
+        psq       = int(sum(x ** 2 for x in r["mom"]))
+        irrep_psq = f"{r['irrep']}({psq})"
+        pct_strs  = "  ".join(f"{w * 100:>11.1f}%" for w in r["weights"])
         _out(
-            f"  {r['irrep']:>10s}  {psq:>4d}  {r['Ecm']:>10.6f}  {pct_strs}  "
+            f"  {irrep_psq:>14s}  {r['level']:>3d}  {r['Ecm']:>10.6f}  {pct_strs}  "
             f"{r['dominant_wave']}"
         )
     _out(sep)

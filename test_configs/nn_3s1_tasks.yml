@@ -1,0 +1,59 @@
+# Isosinglet 3S1 (deuteron channel) S-wave-only Luscher fit.
+#
+# Reproduces the NN-tools reference fit jsons/3s1/3s1_par.json entirely from
+# YAML: the task builds the runner JSON from the blocks below.
+#
+#   MPLBACKEND=Agg BMAT_PATH=/path/to/pythib \
+#     python run.py -g test_configs/nn_3s1_general.yml \
+#                   -t test_configs/nn_3s1_tasks.yml
+
+tasks:
+  - single_channel_fit:
+      # Point this at your own spectrum file. The lattice data is not shipped
+      # with the repo; omit data_file entirely to auto-discover the most recent
+      # HDF5 written by an upstream fit_spectrum task.
+      data_file: /Users/jomoscoso/Desktop/NN-tools/Data/nn_iso_singlet_fullspectrum.h5
+      lattice_size: 48
+      continuum: true
+      cutoff: 10
+
+      # 15 levels across five momentum frames.
+      scattering:
+        'N(0)_ref,N(0)_ref':
+          PSQ0:
+            - T1g: [0, 1]
+          PSQ1:
+            - A2: [0, 1]
+            - E:  [0, 1]
+          PSQ2:
+            - A2: [0]
+            - B1: [0]
+            - B2: [0]
+          PSQ3:
+            - A2: [0]
+            - E:  [0]
+          PSQ4:
+            - A2: [0, 1]
+            - E:  [0, 1]
+
+      # NN admits both spin singlet and triplet, so twoS must be explicit.
+      # 3S1: twoS=2 (S=1), L=0, twoJ=2 (J=1).
+      L: 0
+      twoS: 2
+      twoJ: 2
+      k_matrix: poly_s
+      params:
+        - {name: A_3S1, initial: 101.0}
+        - {name: B_3S1, initial: -51.7}
+        - {name: C_3S1, initial: 6.63}
+
+      strategy: multistart
+      n_starts: 24
+      param_bounds:
+        - [-50, 300]
+        - [-150, 50]
+        - [-30, 40]
+      fit_observable: p2
+      fit_cov_from: p2
+      compute_vij: true
+      auto_p0: false

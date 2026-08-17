@@ -1,0 +1,178 @@
+{
+  "study_module": "N_N_3S1",
+  "model_file": "QC2/my_fit_model_par.py",
+  "input": {
+    "file": "/Users/jomoscoso/Desktop/NN-tools/Data/nn_iso_singlet_fullspectrum.h5",
+    "lattice_size": 48,
+    "continuum": true,
+    "cutoff": 10.0
+  },
+  "quantum_numbers": {
+    "channels": [
+      {
+        "name": "N_N_3S1",
+        "twoJ": 2,
+        "L": 0,
+        "Lp": 0,
+        "twoS": 2,
+        "twoSp": 2,
+        "chan": 0,
+        "chanp": 0,
+        "enabled": true,
+        "k_matrix": "poly_s",
+        "params": [
+          {
+            "name": "A_3S1",
+            "initial": 148.8332349
+          },
+          {
+            "name": "B_3S1",
+            "initial": -75.37092699
+          },
+          {
+            "name": "C_3S1",
+            "initial": 9.546067329
+          }
+        ]
+      }
+    ]
+  },
+  "fit": {
+    "MN": 1.0,
+    "MK": 1.0,
+    "strategy": "multistart",
+    "n_starts": 24,
+    "n_refine": 400,
+    "n_maxiter": 10000,
+    "xatol": 1e-06,
+    "fatol": 1e-06,
+    "step_mode": "adaptive",
+    "fit_mode": "omega",
+    "fit_observable": "p2",
+    "fit_cov_from": "p2",
+    "compute_vij": false,
+    "auto_p0": false,
+    "skip_minimization": true,
+    "param_bounds": [
+      [
+        -50,
+        300
+      ],
+      [
+        -150,
+        50
+      ],
+      [
+        -30,
+        40
+      ]
+    ]
+  },
+  "plot": {
+    "enabled": true,
+    "save_path": "/tmp/pycalq_nn_3s1/6single_channel_fit/plots/hpw_fit_spectrum.pdf",
+    "save_timestamp": true,
+    "com_frame": true,
+    "show": false,
+    "ylabel": "$E^\\star / m_N$",
+    "show_ni": true,
+    "show_level_labels": true,
+    "figures_dir": "/tmp/pycalq_nn_3s1/6single_channel_fit/plots",
+    "bmatrix_preview": {
+      "enabled": false,
+      "save_path": "/tmp/pycalq_nn_3s1/6single_channel_fit/plots/bmatrix_preview.pdf",
+      "n_sweep": 800,
+      "clip": 30.0,
+      "y_scale_mode": "data_central",
+      "show": false
+    }
+  },
+  "logging": {
+    "enabled": true,
+    "dir": "/tmp/pycalq_nn_3s1/6single_channel_fit/logs",
+    "prefix": "hpw_fit",
+    "level": "INFO"
+  },
+  "data": [
+    {
+      "momentum": [
+        0,
+        0,
+        0
+      ],
+      "irreps": {
+        "T1g": [
+          0,
+          1
+        ]
+      }
+    },
+    {
+      "momentum": [
+        0,
+        0,
+        1
+      ],
+      "irreps": {
+        "A2": [
+          0,
+          1
+        ],
+        "E": [
+          0,
+          1
+        ]
+      }
+    },
+    {
+      "momentum": [
+        1,
+        1,
+        0
+      ],
+      "irreps": {
+        "A2": [
+          0
+        ],
+        "B1": [
+          0
+        ],
+        "B2": [
+          0
+        ]
+      }
+    },
+    {
+      "momentum": [
+        1,
+        1,
+        1
+      ],
+      "irreps": {
+        "A2": [
+          0
+        ],
+        "E": [
+          0
+        ]
+      }
+    },
+    {
+      "momentum": [
+        0,
+        0,
+        2
+      ],
+      "irreps": {
+        "A2": [
+          0,
+          1
+        ],
+        "E": [
+          0,
+          1
+        ]
+      }
+    }
+  ]
+}

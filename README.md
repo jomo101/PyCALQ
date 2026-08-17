@@ -5,13 +5,29 @@ Full analysis chain of the finite volume spectrum from two-point correlators to 
 
 ## Prerequisites
 
-[sigmond pybindings (pip branch)](https://github.com/andrewhanlon/sigmond/tree/pip)
+- [sigmond pybindings (pip branch)](https://github.com/andrewhanlon/sigmond/tree/pip) — needed by
+  the correlator-analysis tasks (`preview_corrs`, `average_corrs`, `rotate_corrs`, `fit_spectrum`,
+  `compare_spectrums`).
+- [pythib](https://github.com/ebatz/pythib) (the `BMat` python bindings for
+  [TwoHadronsInBox](https://github.com/ebatz/TwoHadronsInBox/tree/qSqDependence)) — needed by the
+  `single_channel_fit` (Lüscher) task.
+
+The two halves are independent. `single_channel_fit` starts from an HDF5 spectrum, so it runs
+without sigmond installed; likewise the correlator tasks run without `BMat`. A missing dependency
+disables only the tasks that need it.
 
 ## Setup
 ```
 cd PyCALQ/
 pip install -r requirements.txt
 ```
+
+`BMat` is built manually rather than pip-installed. Point PyCALQ at the build directory:
+```
+export BMAT_PATH=/path/to/pythib
+```
+Any location on `PYTHONPATH` works too. If `BMat` cannot be imported, `single_channel_fit` raises
+an error naming this variable.
 
 ## Sample usage
 
@@ -420,93 +436,148 @@ Unique task input descriptions:
 
 ### Single Channel Fit
 Using the finite-volume spectrum produced by `fit_spectrum` (or any compatible HDF5 file), fits a
-K-matrix parametrization to the Lüscher quantization condition using the HPW B-matrix (BMAT) method.
-The fit is driven by `QC2/run_HPW_fit.py` (`GenericFitRunner`) and the study module `QC2/my_fit_model.py`.
+K-matrix parametrization to the Lüscher quantization condition using the HPW B-matrix (BMAT) method,
+and reports phase shifts, mixing angles and fit diagnostics.
+
+Requires `BMat` (see [Prerequisites](#prerequisites)); it does **not** require sigmond, so this task
+can be run on its own against an existing spectrum file.
+
+The task lives in `QC2/`:
+
+| file | role |
+|---|---|
+| `QC2/hpw_fit_task.py` | the PyCALQ task: YAML → JSON config bridge, project-directory wiring |
+| `QC2/run_HPW_fit.py` | `GenericFitRunner` — config parsing, fit orchestration, plotting, logging |
+| `QC2/my_fit_model_par.py` | **default engine**: tabulates B(E) once, solves roots vectorized, uses a process pool |
+| `QC2/my_fit_model.py` | reference serial engine; also supplies all plotting/diagnostics to the parallel engine |
+| `QC2/plotting.py` | plot styling and figure helpers |
 
 Two usage modes are supported.
 
 #### Mode 1 – Auto-config (recommended)
-All settings live in the tasks YAML. A GenericFitRunner JSON config is generated automatically
-and saved to the task log directory. The HDF5 input file is found automatically from the
-`fit_spectrum` data directory if `data_file` is omitted.
+All settings live in the tasks YAML. A `GenericFitRunner` JSON config is generated automatically and
+saved to the task log directory, so the exact inputs of a run stay reproducible. The HDF5 input file
+is found automatically from the `fit_spectrum` data directory if `data_file` is omitted.
 
-Quantum numbers (`twoJ`, `twoS`) are derived from the particle names in `general/particles.py`
-using the `scattering` channel string. The partial wave `L` defaults to `0` (S-wave) and can
-be overridden. Only the K-matrix initial parameter guesses (`params`) must be provided.
+Quantum numbers are derived from the particle names in `general/particles.py` using the `scattering`
+channel string. Where the spin is ambiguous — NN admits both the singlet and the triplet — `twoS`
+must be given explicitly; the task warns and picks the minimum otherwise. The partial wave `L`
+defaults to `0` (S-wave), and `twoJ` defaults to the minimum `|2L - twoS|`.
 
 ```yaml
 - single_channel_fit:
     data_file: /path/to/spectrum.hdf5   # omit to auto-discover from fit_spectrum output
+    lattice_size: 48                    # taken from ensemble_id when sigmond is available
+    continuum: true
+    cutoff: 10
 
     scattering:
-      'N(0)_ref,pi(0)_ref':             # two hadrons separated by comma
+      'N(0)_ref,N(0)_ref':              # two hadrons separated by comma
         PSQ0:
-          - G1u: [0, 1, 2]             # irrep: list of level indices
+          - T1g: [0, 1]                 # irrep: list of level indices
         PSQ1:
-          - G1: [0, 1]
-        PSQ2:
-          - G: [0, 1]
-        PSQ3:
-          - G: [0, 1]
+          - A2: [0, 1]
+          - E:  [0, 1]
 
-    # twoS is auto-derived from particles.py; twoJ = |2L - twoS| by default
-    L: 0                # partial wave integer (0=S, 1=P, 2=D, ...)
-    k_matrix: polynomial  # polynomial | ERE | zero
-    params:             # K-matrix initial guesses (required)
-      - {name: c0, initial: -0.2}
-      - {name: c1, initial: 0.7}
-
-    # Optional overrides
-    # twoS: 1
-    # twoJ: 1
+    # 3S1: twoS=2 (S=1), L=0, twoJ=2 (J=1)
+    L: 0                  # partial wave: 0/'S', 1/'P', 2/'D', ...
+    twoS: 2               # required for NN, where S=0 and S=1 are both allowed
+    twoJ: 2               # defaults to |2L - twoS|
+    k_matrix: poly_s
+    params:
+      - {name: A_3S1, initial: 101.0}
+      - {name: B_3S1, initial: -51.7}
+      - {name: C_3S1, initial: 6.63}
 
     # Fit settings (all optional – defaults shown)
-    MN: 1.0
-    MK: 1.0
-    strategy: nelder-mead  # nelder-mead | powell | ...
+    strategy: least_squares   # least_squares | multistart | nelder-mead
     n_starts: 20
-    n_refine: 400
-    auto_p0: false         # estimate initial params from B-matrix before fit
-    cutoff: 10.0           # discard levels with E_cm/m_N above this value
-    study_module: QC2.my_fit_model
-    bmat_preview_only: false  # true = only plot B-matrix preview, skip fit
+    fit_observable: shift     # shift | p2 | ecm | elab
+    fit_cov_from: shift       # must match fit_observable's convention
+    compute_vij: true         # parameter covariance from the Hessian
+    param_bounds: []
+    auto_p0: false
+    skip_minimization: false
+    n_workers: 8              # parallel engine worker processes
 ```
 
 Short descriptions of unique task inputs:
 - `data_file` - (str) path to the HDF5 spectrum file. Auto-discovered from the `fit_spectrum`
   data directory if omitted.
-- `scattering` - (dict) channel → PSQ → list of `{irrep: [level_indices]}`. Drives both the
-  data selection and the quantum-number inference.
-- `L` - (int or str) orbital angular momentum of the partial wave: `0`/`'S'`, `1`/`'P'`, `2`/`'D'`, …
-- `k_matrix` - (str) K-matrix parametrization type for the channel.
-- `params` - (list) K-matrix initial parameter guesses, each as `{name: <str>, initial: <float>}`.
-- `twoS` - (int) override auto-derived total spin (2×S). Needed when multiple spin states are
-  possible (e.g. NN).
-- `twoJ` - (int) override auto-derived total angular momentum (2×J).
-- `MN`, `MK` - (float) reference masses for nucleon and kaon in units of `m_ref`.
-- `strategy` - (str) optimizer strategy passed to `scipy.optimize.minimize`.
-- `n_starts` - (int) number of random restarts for the minimizer.
-- `n_refine` - (int) grid resolution for root-finding.
-- `auto_p0` - (bool) if true, estimates initial parameters from the B-matrix before minimizing.
-- `cutoff` - (float) energy cutoff; levels above this are excluded from the fit.
-- `study_module` - (str) Python import path for the fit study module.
-- `bmat_preview_only` - (bool) if true, produces only the B-matrix preview plot and skips the fit.
+- `lattice_size` - (int) spatial extent `L`. Read from `ensemble_id` when sigmond is installed,
+  otherwise taken from this value.
+- `continuum` - (bool) reconstruct `E` from the continuum dispersion rather than the lattice one.
+- `cutoff` - (float) discard levels with mean `E*/m_N` at or above this value.
+- `scattering` - (dict) channel → PSQ → list of `{irrep: [level_indices]}`. Drives both the data
+  selection and the quantum-number inference. Omit to fit every level found in the file.
+- `L` - (int or str) orbital angular momentum: `0`/`'S'`, `1`/`'P'`, `2`/`'D'`, …
+- `twoS`, `twoJ` - (int) 2×S and 2×J. `twoS` is inferred from `particles.py` where unambiguous.
+- `k_matrix` - (str) parametrization: `poly_s` (Σ cₙsⁿ), `polynomial` (Σ cₙp²ⁿ), `constant`,
+  `linear`, `ere`, `ere1_vs`, `epsilon` (mixing angle), `zero`.
+- `params` - (list) K-matrix initial guesses, each `{name: <str>, initial: <float>}`.
+- `quantum_numbers` - (dict) explicit channel list; overrides all inference above and is the only
+  way to express coupled blocks (see below).
+- `strategy` - (str) `least_squares` (whitened residuals, parallel Jacobian), `multistart`
+  (`n_starts` local fits), or `nelder-mead`.
+- `fit_observable` / `fit_cov_from` - (str) the quantity fit and the covariance used. Keep these on
+  the same convention; mixing `p2` residuals with `shift` covariance drifts the result.
+- `compute_vij` - (bool) compute the parameter covariance matrix after the fit.
+- `param_bounds` - (list) `[[lo, hi], ...]` per parameter, used by `least_squares`/`multistart`.
+- `bootstrap` - (dict) bootstrap refit sub-block, e.g. `{enabled: true, n_samples: 1000}`.
+- `n_workers` - (int) worker processes for the parallel engine; `0` disables multiprocessing.
+- `model_file` - (str) engine to use; defaults to `my_fit_model_par.py`.
+- `bmat_preview_only` - (bool) produce only the B-matrix preview plot and skip the fit.
+
+##### Coupled channels
+A coupled block (e.g. ³S₁–³D₁ with a mixing angle ε₁) needs an explicit `quantum_numbers` block:
+`L_values` lists the coupled waves, and `k_matrix` becomes a list of parametrizations — one per
+parameter group, in the order (first wave, second wave, mixing):
+
+```yaml
+    quantum_numbers:
+      channels:
+        - name: 3S1_3D1
+          twoJ: 2
+          L_values: [0, 2]
+          twoS: 2
+          enabled: true
+          k_matrix: [poly_s, poly_s, epsilon]
+          params:
+            - [{name: A_S, initial: -0.2}, {name: B_S, initial: 0.7}]
+            - [{name: A_D, initial: -0.01}]
+            - [{name: eps0, initial: 0.05}]
+```
+
+Setting `enabled: false` on a channel removes that wave from the quantization-condition basis
+entirely, rather than merely fixing its parameters.
 
 #### Mode 2 – Pre-made JSON config
-For full control, or when reusing a config from a previous standalone run, point to a
-pre-made GenericFitRunner JSON file:
+For full control, or when reusing a config from a standalone run, point to a pre-made
+`GenericFitRunner` JSON file. Every flag the runner understands is available this way:
 
 ```yaml
 - single_channel_fit:
     config_file: test_configs/c103_hpw_fit.json
-    study_module: QC2.my_fit_model   # optional override of value in JSON
     bmat_preview_only: false
 ```
 
-See `test_configs/c103_hpw_fit.json` for a fully annotated example of the JSON format.
+#### Worked example
+`test_configs/nn_3s1_*.yml` fit the isosinglet ³S₁ (deuteron) channel over 15 levels in five
+momentum frames, and reproduce the corresponding standalone NN-tools fit exactly
+(χ² = 28.648069, χ²/dof = 2.387 at 12 dof):
+
+```bash
+export BMAT_PATH=/path/to/pythib
+MPLBACKEND=Agg python run.py -g test_configs/nn_3s1_general.yml -t test_configs/nn_3s1_tasks.yml
+```
+
+Set `MPLBACKEND=Agg` for non-interactive runs; without it matplotlib can stall on a `plt.show`-type
+call. Outputs land under `<project_dir>/6single_channel_fit/`: the generated JSON config and run log
+in `logs/`, and the spectrum, Lüscher `k·cotδ`, phase-shift and diagnostic plots in
+`plots/<channel>/`.
 
 #### Standalone usage (no PyCALQ pipeline)
-`run_HPW_fit.py` can also be run directly from the command line with only a JSON config:
+`run_HPW_fit.py` can also be run directly with only a JSON config:
 
 ```bash
 # Full fit
@@ -514,13 +585,7 @@ python QC2/run_HPW_fit.py test_configs/c103_hpw_fit.json
 
 # B-matrix preview only (no minimization)
 python QC2/run_HPW_fit.py test_configs/c103_hpw_fit.json --bmat-preview-only
-
-# Override the study module
-python QC2/run_HPW_fit.py test_configs/c103_hpw_fit.json --module QC2.my_fit_model
 ```
-
-
-
 ## Setting up a New Task
 In order to create additional tasks, one should set up a task using the folowing skeleton:
 ```

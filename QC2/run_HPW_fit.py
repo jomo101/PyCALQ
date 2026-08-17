@@ -1,5 +1,4 @@
 import argparse
-import glob
 import importlib
 import importlib.util
 import json
@@ -14,8 +13,7 @@ import matplotlib
 import numpy as np
 
 import plotting as pt
-import plot_spectrum as _ps
-import fit_plots
+import plotting as _pt
 
 # Default to headless plotting for CLI fits so repeated minimizations do not
 # spawn/accumulate GUI-backed Python app processes on macOS.
@@ -24,7 +22,10 @@ if os.environ.get("HPW_HEADLESS", "1").strip().lower() not in ("0", "false", "no
 
 import matplotlib.pyplot as plt
 
-pt.apply_plot_style(use_tex=True)
+# Skip TeX plot styling when this module is re-imported inside a spawned fit
+# worker process (matplotlib LaTeX probing is slow and races across workers).
+if os.environ.get("HPW_FIT_WORKER") != "1":
+    pt.apply_plot_style(use_tex=True)
 
 
 class GenericFitRunner:
@@ -78,7 +79,7 @@ class GenericFitRunner:
             self.logger.log(level, message, *args)
             return
         text = message % args if args else message
-        print(text)
+        print(text, flush=True)
 
     def _start_logging_if_enabled(self):
         if not self.run_timestamp:
@@ -471,6 +472,29 @@ class GenericFitRunner:
             )
             return template
             
+    def _apply_figures_dir(self, resolved_path, as_dir=False):
+        """If figures_dir is configured, redirect the save path into the
+        per-fit subfolder figures_dir/<study_module>/ (keeping the filename).
+        Set "plot": {"figures_flat": true} to keep the old flat layout.
+        With as_dir=True, return the per-fit directory itself."""
+        figures_dir = getattr(self, '_figures_dir', None)
+        if not figures_dir:
+            return None if as_dir else resolved_path
+        if getattr(self, '_figures_flat', False):
+            sub = figures_dir
+        else:
+            sub = os.path.join(figures_dir, self.study_module_name)
+        if as_dir:
+            os.makedirs(sub, exist_ok=True)
+            return sub
+        if not resolved_path:
+            return resolved_path
+        fname = os.path.basename(resolved_path)
+        if not fname:
+            return resolved_path
+        os.makedirs(sub, exist_ok=True)
+        return os.path.join(sub, fname)
+
     def _resolve_subplot_save_path(self, plot_cfg):
         """Resolve save path for level subplot comparison plots."""
         template = plot_cfg.get("subplot_save_path")
@@ -503,17 +527,24 @@ class GenericFitRunner:
             results_text (str): The text to save as an image.
             save_path (str): The path to save the image.
         """
-        # Create a figure
-        fig, ax = plt.subplots(figsize=(7, 5))
-        ax.axis('off')  # Turn off the axes
+        # Render WITHOUT TeX: the results text contains raw underscores
+        # (e.g. 3S1_3D1_coupled.A_S) that make the latex subprocess hang or
+        # fail, which blocked the whole run at the very end.
+        try:
+            with matplotlib.rc_context({"text.usetex": False}):
+                fig, ax = plt.subplots(figsize=(7, 5))
+                ax.axis('off')  # Turn off the axes
 
-        # Add the text to the figure with left alignment
-        ax.text(0.05, 0.95, results_text, fontsize=11, ha='left', va='top', 
-                transform=ax.transAxes, fontfamily='monospace')
+                # Add the text to the figure with left alignment
+                ax.text(0.05, 0.95, results_text, fontsize=11, ha='left', va='top',
+                        transform=ax.transAxes, fontfamily='monospace')
 
-        # Save the figure as an image
-        plt.savefig(save_path, bbox_inches='tight', dpi=150)
-        plt.close()
+                # Save the figure as an image
+                plt.savefig(save_path, bbox_inches='tight', dpi=150)
+                plt.close()
+        except Exception as exc:
+            print(f"WARNING: could not save results image ({exc})", flush=True)
+            plt.close("all")
 
     def _calculate_noninteracting_energies(self, mom_vectors, lattice_size, massN):
         """Calculate non-interacting energy levels for comparison."""
@@ -579,9 +610,10 @@ class GenericFitRunner:
             entries = []
             for key in h5_file.keys():
                 if key != 'mN':
-                    irrep = key.split("_")[0]
-                    mom2  = int(key.split("_")[1][-1])
-                    level = int(key.split("_")[-1][-1])
+                    parts = key.split("_")
+                    irrep = parts[0]
+                    mom2  = int(parts[1].replace("Psq", ""))
+                    level = int(parts[-1].replace("level", ""))
                     entries.append({
                         "level": level,
                         "nP": mom2,
@@ -674,7 +706,7 @@ class GenericFitRunner:
             )
         )
         datap2 = data2cm**2 / 4 - 1.0
-        covp2  = np.cov(datap2)
+        covp2  = np.cov(datap2[:, 1:])   # col 0 is the mean; covariance from bootstrap samples only
         framesall, irrepsall, levelsall = self._build_grouped_inputs(kept_mom2, kept_irreps)
         energy_cm_data = self.study.build_energy_cm_dict(
             data2cm, kept_mom2, kept_irreps, kept_levels
@@ -725,16 +757,16 @@ class GenericFitRunner:
             entries = []
             for key in h5_file.keys():
                 if key != 'mN':
-                    irrep = key.split("_")[0]
-                    mom2 = int(key.split("_")[1][-1])
-                    level =  int(key.split("_")[-1][-1])
+                    parts = key.split("_")
+                    irrep = parts[0]
+                    mom2  = int(parts[1].replace("Psq", ""))
+                    level = int(parts[-1].replace("level", ""))
                     entries.append({
-                            "level": level,
-                            "nP": mom2,
-                            "irrep": irrep,
-                            "momentum":  self._assign_momentum_to_nP( mom2 ),
-                        })
-            # Sort entries by nP in ascending order
+                        "level": level,
+                        "nP": mom2,
+                        "irrep": irrep,
+                        "momentum": self._assign_momentum_to_nP(mom2),
+                    })
             entries = sorted(entries, key=lambda x: x["nP"])
             return entries
 
@@ -788,6 +820,8 @@ class GenericFitRunner:
             kept_nPvec = []
             kept_entries = []
             rejected_entries = []
+            data_shifts_raw = np.zeros((0, n_bootstrap))  # raw dE_NN in lattice units
+            ni_sum_central  = []                           # E_N1_c + E_N2_c per level
 
             for i, name in enumerate(names):
                 #self._log(logging.INFO, "read now %s", name)
@@ -804,21 +838,24 @@ class GenericFitRunner:
                     )
 
                 if continuum:
-                    shift = f2[name + "/dE_NN"]
+                    shift = np.array(f2[name + "/dE_NN"])
                     E_N1 = np.sqrt(massN**2 + f2[name + "/Psq_N1"][0] * (two_pi_over_L) ** 2)
                     E_N2 = np.sqrt(massN**2 + f2[name + "/Psq_N2"][0] * (two_pi_over_L) ** 2)
                     auxread = (shift + E_N1 + E_N2) / massN
+                    _ni_c = float(E_N1[0] + E_N2[0])   # central single-particle sum (lattice units)
                 else:
-                    auxread = (
-                        np.array(f2[name + "/E_N1"])
-                        + np.array(f2[name + "/E_N2"])
-                        + np.array(f2[name + "/dE_NN"])
-                    ) / massN
+                    shift   = np.array(f2[name + "/dE_NN"])
+                    E_N1_arr = np.array(f2[name + "/E_N1"])
+                    E_N2_arr = np.array(f2[name + "/E_N2"])
+                    auxread  = (E_N1_arr + E_N2_arr + shift) / massN
+                    _ni_c    = float(E_N1_arr[0] + E_N2_arr[0])
 
-                auxread2 = np.array(f2[name + "/dE_NN"]) / massN
+                auxread2 = shift / massN
                 if np.mean(auxread) < cutoff2:
                     data2 = np.vstack((data2, auxread))
                     datashifts = np.vstack((datashifts, auxread2))
+                    data_shifts_raw = np.vstack((data_shifts_raw, shift))
+                    ni_sum_central.append(_ni_c)
                     kept_mom2.append(selection_entries[i]["momentum"])
                     kept_irreps.append(selection_entries[i]["irrep"])
                     kept_levels.append(selection_entries[i]["level"])
@@ -826,6 +863,7 @@ class GenericFitRunner:
                     kept_entries.append(selection_entries[i])
                 else:
                     rejected_entries.append(selection_entries[i])
+            ni_sum_central = np.asarray(ni_sum_central, dtype=float)   # shape (n_levels,)
 
         if rejected_entries:
             self._log_data_entries("Levels rejected by cutoff", rejected_entries)
@@ -835,17 +873,95 @@ class GenericFitRunner:
             raise ValueError("No selected levels passed the cutoff; adjust selection or cutoff in config.")
         data_Elab_mref = data2
         data2cm = np.sqrt(data2**2 - np.outer(np.array(kept_nPvec), (2 * math.pi / lattice_size / massN) ** 2))
-        datap2 = data2cm**2 / 4 - 1.0
-        covp2 = np.cov(datap2)
+        datap2  = data2cm**2 / 4 - 1.0
+        ni_sum_central = np.asarray(ni_sum_central, dtype=float)
+
+        # ── Observable & covariance selection ─────────────────────────────────
+        fit_cfg      = self.config["fit"]
+        _fit_obs     = str(fit_cfg.get("fit_observable", "shift"))
+        _fit_cov_src = str(fit_cfg.get("fit_cov_from",   "shift"))
+
+        # Shift normalised by mN: dimensionless dE_NN/mN — same units as the
+        # model output (epred = Ecm/mN, ni_sum/mN).  datashifts is already
+        # computed as dE_NN/massN during data loading.
+        _mN0 = float(massN[0])
+        _Cov_shift_raw = np.cov(data_shifts_raw[:, 1:])            # raw lattice units²
+        _Cov_shift_norm = _Cov_shift_raw / (_mN0 ** 2)             # normalised (dimensionless)
+
+        if _fit_obs == "p2":
+            _data_obs = datap2
+        elif _fit_obs == "ecm":
+            _data_obs = data2cm
+        elif _fit_obs == "elab":
+            # True lab-frame energy, normalised: E_lab/mN — exactly how the
+            # levels are stored in the h5 (data2 = E_lab/mN per sample).
+            # The model converts its E_cm/mN roots via
+            # E_lab/mN = sqrt(ecm^2 + (P/mN)^2); the per-level lab boost
+            # (P/mN)^2 rides in the ni_sum slot (see _to_observable).
+            _data_obs = data2
+            ni_sum_central = (np.asarray(kept_nPvec, dtype=float)
+                              * (2 * math.pi / lattice_size / _mN0) ** 2)
+        elif _fit_obs == "shift":
+            # Normalised lab-frame shift dE_NN/mN. dE_NN and the NI sum are
+            # lab-frame quantities, so the model must boost its cm root:
+            #   shift/mN = sqrt((Ecm/mN)^2 + (P/mN)^2) - ni_sum_lab/mN.
+            # ni_sum carries both rows: [ni_sum_lab/mN, (P/mN)^2]
+            # (see _to_observable; a 1-D ni_sum falls back to the old
+            # rest-frame-only formula Ecm/mN - ni_sum/mN).
+            _data_obs = datashifts
+            _psq_norm = (np.asarray(kept_nPvec, dtype=float)
+                         * (2 * math.pi / lattice_size / _mN0) ** 2)
+            ni_sum_central = np.stack([ni_sum_central / _mN0, _psq_norm])
+        else:
+            raise ValueError(f"Unknown fit_observable '{_fit_obs}'. Use: p2 | ecm | elab | shift")
+
+        if _fit_cov_src == "shift":
+            _Ecm_c = data2cm[:, 0]
+            if _fit_obs == "shift":
+                _J = np.ones(len(_Ecm_c))                          # dX/d(shift/mN) = 1
+                covp2 = _Cov_shift_norm
+            elif _fit_obs == "elab":
+                # shift is a lab-frame energy difference, so
+                # d(E_lab/mN)/d(shift/mN) = 1: normalised shift covariance.
+                covp2 = _Cov_shift_norm
+            elif _fit_obs == "ecm":
+                _J = np.ones(len(_Ecm_c)) / _mN0
+                covp2 = np.outer(_J, _J) * _Cov_shift_raw
+            else:  # p2
+                _J = _Ecm_c / (2.0 * _mN0)
+                covp2 = np.outer(_J, _J) * _Cov_shift_raw
+        else:
+            covp2 = np.cov(_data_obs[:, 1:])
+
+        self._log(logging.INFO, "fit_observable=%s  fit_cov_from=%s", _fit_obs, _fit_cov_src)
+
         framesall, irrepsall, levelsall = self._build_grouped_inputs(kept_mom2, kept_irreps)
 
         energy_cm_data = self.study.build_energy_cm_dict(data2cm, kept_mom2, kept_irreps, kept_levels)
         # print("Energy CM data:", energy_cm_data)
         # ref masses
-        fit_cfg = self.config["fit"]
         mass_n = float(fit_cfg.get("MN", 1.0))
         mass_k = float(fit_cfg.get("MK", 1.0))
         plot_cfg = self.config.get("plot", {})
+        # ── figures_dir: single directory for all output figures ──────────────
+        # Defaults to ./figures, so every run's figures land together in
+        # ./figures/<study_module>/ (set figures_dir explicitly to group
+        # campaigns, e.g. ./figures/SD_par; figures_dir: false disables).
+        _fd = plot_cfg.get("figures_dir", "./figures")
+        if isinstance(_fd, str) and _fd:
+            try:
+                _fd = _fd.format(
+                    study_module=self.study_module_name,
+                    study_model=self.study_module_name,
+                    module=self.study_module_name,
+                )
+            except (KeyError, ValueError):
+                _fd = _fd.replace("{study_module}", self.study_module_name)
+            self._figures_dir = _fd.rstrip("/\\")
+            os.makedirs(self._figures_dir, exist_ok=True)
+        else:
+            self._figures_dir = None
+        self._figures_flat = bool(plot_cfg.get("figures_flat", False))
         if plot_cfg.get("enabled", True):
             if plot_cfg.get("save_timestamp", True):
                 plot_save_path = self._resolve_plot_save_path(plot_cfg)
@@ -853,6 +969,7 @@ class GenericFitRunner:
                 plot_save_path = plot_cfg.get("save_path", f"./Images/Spectrum/fit_{self.study_module_name}.pdf")
             if "{study_module}" in plot_save_path:
                 plot_save_path = plot_save_path.format(study_module=self.study_module_name)
+            plot_save_path = self._apply_figures_dir(plot_save_path)
             if isinstance(plot_save_path, str):
                 plot_dir = os.path.dirname(plot_save_path)
                 if plot_dir:
@@ -861,7 +978,16 @@ class GenericFitRunner:
             _figsize = plot_cfg.get("spectrum_figsize", None)
             if isinstance(_figsize, list) and len(_figsize) == 2:
                 _figsize = tuple(_figsize)
-            _ps.make_spectrum_plot(
+            # y-axis framing: by default frame the DATA range so predicted/NI
+            # levels above the top data point don't inflate the top margin.
+            # Override with plot.spectrum_ylim [lo, hi], or tune the headroom
+            # with plot.y_from_data / plot.y_top_pad / plot.y_bottom_pad.
+            _spectrum_ylim = plot_cfg.get("spectrum_ylim", None)
+            if isinstance(_spectrum_ylim, list) and len(_spectrum_ylim) == 2:
+                _spectrum_ylim = tuple(_spectrum_ylim)
+            else:
+                _spectrum_ylim = None
+            _pt.plot_energies_vs_irreps(
                 energy_cm_data,
                 massN,
                 lattice_size,
@@ -870,14 +996,31 @@ class GenericFitRunner:
                 ylabel=plot_cfg.get("ylabel", r"$E^\star / m_N $"),
                 show=bool(plot_cfg.get("show", False)),
                 show_ni=bool(plot_cfg.get("show_ni", True)),
-                show_level_labels=bool(plot_cfg.get("show_level_labels", True)),
+                show_level_labels=bool(plot_cfg.get("show_level_labels", False)),
                 figsize=_figsize,
                 title=plot_cfg.get("title", None),
+                ylim=_spectrum_ylim,
+                y_from_data=bool(plot_cfg.get("y_from_data", True)),
+                y_top_pad=float(plot_cfg.get("y_top_pad", 0.08)),
+                y_bottom_pad=float(plot_cfg.get("y_bottom_pad", 0.05)),
             )
+            # _ps.make_spectrum_plot(
+            #     energy_cm_data,
+            #     massN,
+            #     lattice_size,
+            #     save_path=plot_save_path,
+            #     C_o_M=plot_cfg.get("com_frame", True),
+            #     ylabel=plot_cfg.get("ylabel", r"$E^\star / m_N $"),
+            #     show=bool(plot_cfg.get("show", False)),
+            #     show_ni=bool(plot_cfg.get("show_ni", True)),
+            #     show_level_labels=bool(plot_cfg.get("show_level_labels", False)),
+            #     figsize=_figsize,
+            #     title=plot_cfg.get("title", None),
+            # )
             
             # Create level-by-level subplot comparison with non-interacting energies
             if plot_cfg.get("level_subplots", False):
-                subplot_save_path = self._resolve_subplot_save_path(plot_cfg)
+                subplot_save_path = self._apply_figures_dir(self._resolve_subplot_save_path(plot_cfg))
                 self._log(logging.INFO, "Level subplot save path: %s", subplot_save_path)
                 noninteracting_energies = self._calculate_noninteracting_energies(
                     kept_mom2, lattice_size, massN
@@ -900,8 +1043,7 @@ class GenericFitRunner:
                 else:
                     preview_save = plot_save_path + f"_bmatrix_preview.pdf"
                 self._log(logging.INFO, "Plotting B matrix preview (pre-fit)...")
-                fit_plots.plot_bmatrix_preview(
-                    self.study,
+                self.study.plot_bmatrix_preview(
                     data2cm,
                     kept_mom2,
                     kept_irreps,
@@ -914,6 +1056,8 @@ class GenericFitRunner:
                     save_path = preview_save,
                     show    = False,
                     y_scale_mode = plot_cfg.get("bmatrix_preview", {}).get("y_scale_mode", "data_central"),
+                    show_level_labels = bool(plot_cfg.get("bmatrix_preview", {})
+                                             .get("show_level_labels", False)),
                 )
                 self._log(logging.INFO, "B matrix preview saved: %s", preview_save)
                 return
@@ -921,7 +1065,7 @@ class GenericFitRunner:
         # fit_cfg = self.config["fit"]
         p0 = self._resolve_initial_params(fit_cfg)
         n_refine   = int(fit_cfg.get("n_refine", 400))      # root-finding grid resolution
-        step_mode  = str(fit_cfg.get("step_mode", "adaptive"))   # 'adaptive' or 'uniform'
+        step_mode  = str(fit_cfg.get("step_mode", "adaptive"))   # 'adaptive' or 'uniform' or "fast"
         # mN_err: uncertainty on MN used to set the NI-level buffer automatically.
         # If "mN_err" is not in the JSON, it is auto-derived from the standard
         # deviation of the massN bootstrap samples (massN[0] = central value,
@@ -930,7 +1074,7 @@ class GenericFitRunner:
         if _mN_err_cfg is not None:
             mN_err = float(_mN_err_cfg)
         elif hasattr(massN, "__len__") and len(massN) > 1:
-            mN_err = float(np.std(massN))
+            mN_err = float(np.std(massN[1:]))   # col 0 is the mean; std from bootstrap samples only
         else:
             mN_err = None
         n_maxiter = int(fit_cfg.get("n_maxiter", 10000))  # optimizer max iterations
@@ -948,12 +1092,11 @@ class GenericFitRunner:
         preview_cfg = plot_cfg.get("bmatrix_preview", {})
         print(kept_levels)
         if preview_cfg.get("enabled", False):
-            preview_save = preview_cfg.get(
+            preview_save = self._apply_figures_dir(preview_cfg.get(
                 "save_path", f"./Images/Spectrum/bmatrix_preview_{self.study_module_name}.pdf"
-            )
+            ))
             self._log(logging.INFO, "Plotting B matrix preview (pre-fit)...")
-            fit_plots.plot_bmatrix_preview(
-                self.study,
+            self.study.plot_bmatrix_preview(
                 data2cm,
                 kept_mom2,
                 kept_irreps,
@@ -999,7 +1142,9 @@ class GenericFitRunner:
             self._log(logging.INFO, "Truncation after max_iter: %d callback iterations", max_iter)
         for name, value in zip(param_labels, p0):
             self._log(logging.INFO, "Initial guess %-24s = % .10g", name, value)
-        self._log(logging.INFO, "Number of data points: %d", len(datap2[:, 0]))
+        # Central data values in the chosen observable space
+        _data_central = _data_obs[:, 0]
+        self._log(logging.INFO, "Number of data points: %d  (observable=%s)", len(_data_central), _fit_obs)
 
         # ── pretty-print data covariance ─────────────────────────────────────
         _errs = np.sqrt(np.diag(covp2))
@@ -1021,41 +1166,62 @@ class GenericFitRunner:
         fit_strategy  = fit_cfg.get("strategy", "nelder-mead")
         n_starts      = int(fit_cfg.get("n_starts", 20))
         param_bounds  = fit_cfg.get("param_bounds", None)  # [[lo,hi], ...]
-        xatol         = float(fit_cfg.get("xatol", 1e-6))   # param convergence tolerance
-        fatol         = float(fit_cfg.get("fatol", 1e-6))   # function convergence tolerance
+        xatol         = float(fit_cfg.get("xatol", 1e-6))
+        fatol         = float(fit_cfg.get("fatol", 1e-6))
+        # fit_mode: "omega" (default) uses getOmegaFromEcm; "eigenvalue" uses
+        # getEigenvaluesFromEcm with λ/√(μ²+λ²) regularisation.
+        # Passed only if the study module's minimizechi2 accepts it (e.g. fitting_code.py).
+        fit_mode = str(fit_cfg.get("fit_mode", "omega"))
         if skip_minimization:
             self._log(logging.INFO, "=" * 50)
             self._log(logging.INFO, "SKIP MINIMIZATION: running chi2 with config params only")
             self._log(logging.INFO, "=" * 50)
             par       = np.asarray(p0, dtype=float)
             chi2_val  = self.study._chi2(
-                par, datap2[:, 0],
+                par, _data_central,
                 framesall, irrepsall, levelsall,
                 massN[0] * lattice_size,
                 covp2, mass_n, mass_k, n=n_refine,
                 data2cm=data2cm, kept_mom2=kept_mom2, kept_irreps=kept_irreps,
                 step_mode=step_mode, n_refine=n_refine, mN_err=mN_err,
+                fit_mode=fit_mode, observable=_fit_obs, ni_sum=ni_sum_central,
             )
             converged = True
         else:
             fit_start = datetime.now()
             self._log(logging.INFO, "Starting chi2 minimization...")
             self._log(logging.INFO, "%s", "~ " * 20)
+            import inspect as _inspect
+            _mc_params = _inspect.signature(self.study.minimizechi2).parameters
+            _extra = {}
+            if "fit_mode"   in _mc_params: _extra["fit_mode"]   = fit_mode
+            if "observable" in _mc_params: _extra["observable"] = _fit_obs
+            if "ni_sum"     in _mc_params: _extra["ni_sum"]     = ni_sum_central
+            _bs_cfg = fit_cfg.get("bootstrap")
+            if "bootstrap" in _mc_params and _bs_cfg:
+                _extra["bootstrap"] = _bs_cfg
+            # multistart basin-mapping knobs (par engine)
+            if "multistart_seed" in _mc_params and "multistart_seed" in fit_cfg:
+                _extra["multistart_seed"] = int(fit_cfg["multistart_seed"])
+            if "multistart_dump" in _mc_params and "multistart_dump" in fit_cfg:
+                _extra["multistart_dump"] = str(fit_cfg["multistart_dump"])
+
             par, chi2_val, converged = self.study.minimizechi2(
-            datap2[:, 0],
-            framesall, irrepsall, levelsall,
-            massN[0] * lattice_size,
-            covp2, p0, mass_n, mass_k, n_refine,
-            max_iter     = max_iter,
-            n_maxiter    = n_maxiter,
-            strategy     = fit_strategy,
-            n_starts     = n_starts,
-            param_bounds = [tuple(b) for b in param_bounds] if param_bounds else None,
-            data2cm=data2cm, kept_mom2=kept_mom2, kept_irreps=kept_irreps,
-            step_mode=step_mode, n_refine=n_refine, mN_err=mN_err,
-            xatol=xatol, fatol=fatol,
-        )
-        
+                _data_central,
+                framesall, irrepsall, levelsall,
+                massN[0] * lattice_size,
+                covp2, p0, mass_n, mass_k, n_refine,
+                max_iter     = max_iter,
+                n_maxiter    = n_maxiter,
+                strategy     = fit_strategy,
+                n_starts     = n_starts,
+                param_bounds = [tuple(b) for b in param_bounds] if param_bounds else None,
+                data2cm=data2cm, kept_mom2=kept_mom2, kept_irreps=kept_irreps,
+                step_mode=step_mode, n_refine=n_refine, mN_err=mN_err,
+                xatol=xatol, fatol=fatol,
+                **_extra,
+            )
+
         fit_end = datetime.now()
         self._log(
             logging.INFO,
@@ -1063,7 +1229,7 @@ class GenericFitRunner:
             (fit_end - fit_start).total_seconds(),
         )
 
-        num_data_points = len(datap2[:, 0])
+        num_data_points = len(_data_central)
         num_parameters = len(par)
         dof = num_data_points - num_parameters
 
@@ -1148,15 +1314,16 @@ class GenericFitRunner:
         vijmat = None  # ← default so plot_omega_and_eigenvalues never gets NameError
         if fit_cfg.get("compute_vij", True):
             vijmat = self.study.vij(
-            par,
-            datap2[:, 0],
-            framesall, irrepsall, levelsall,
-            massN[0] * lattice_size,
-            covp2, mass_n, mass_k,
-            n=n_refine,
-            data2cm=data2cm, kept_mom2=kept_mom2, kept_irreps=kept_irreps,
-            step_mode=step_mode, n_refine=n_refine, mN_err=mN_err,
-        )
+                par,
+                _data_central,
+                framesall, irrepsall, levelsall,
+                massN[0] * lattice_size,
+                covp2, mass_n, mass_k,
+                n=n_refine,
+                data2cm=data2cm, kept_mom2=kept_mom2, kept_irreps=kept_irreps,
+                step_mode=step_mode, n_refine=n_refine, mN_err=mN_err,
+                fit_mode=fit_mode, observable=_fit_obs, ni_sum=ni_sum_central,
+            )
             self._log(logging.INFO, "Cov matrix of parameters")
             self._log(logging.INFO, "%s", vijmat)
             self._log(logging.INFO, "Errors on parameters")
@@ -1206,9 +1373,12 @@ class GenericFitRunner:
             else:
                 # Default path if plotting is disabled
                 results_image_path = f"./Images/fit_results_{self.study_module_name}.png"
-            
+            results_image_path = self._apply_figures_dir(results_image_path)
+
             # Ensure the directory exists
-            os.makedirs(os.path.dirname(results_image_path), exist_ok=True)
+            _ri_dir = os.path.dirname(results_image_path)
+            if _ri_dir:
+                os.makedirs(_ri_dir, exist_ok=True)
             
             # Save the results as an image
             self._save_results_as_image(results_text, results_image_path)
@@ -1254,9 +1424,12 @@ class GenericFitRunner:
             else:
                 # Default path if plotting is disabled
                 results_image_path = f"./Images/fit_results_{self.study_module_name}.png"
-            
+            results_image_path = self._apply_figures_dir(results_image_path)
+
             # Ensure the directory exists
-            os.makedirs(os.path.dirname(results_image_path), exist_ok=True)
+            _ri_dir = os.path.dirname(results_image_path)
+            if _ri_dir:
+                os.makedirs(_ri_dir, exist_ok=True)
             
             # Save the results as an image
             self._save_results_as_image(results_text, results_image_path)
@@ -1327,9 +1500,9 @@ class GenericFitRunner:
                     study_model=self.study_module_name,
                     module=self.study_module_name,
                 )
+            qc_save_path = self._apply_figures_dir(qc_save_path)
             chi2_over_dof = (chi2_val / dof) if dof != 0 else np.nan
-            fit_plots.plot_quantization_condition(
-                self.study,
+            self.study.plot_quantization_condition(
                 par,
                 vijmat,
                 data2cm,
@@ -1349,159 +1522,332 @@ class GenericFitRunner:
                 chi2_over_dof    = chi2_over_dof,
                 save_path        = qc_save_path,
                 show             = bool(qc_cfg.get("show", False)),
+                show_level_labels= bool(qc_cfg.get("show_level_labels", False)),
             )
             self._log(logging.INFO, "Quantization condition plot saved: %s", qc_save_path)
+
+        # ── bootstrap parameter samples, shared by the plot error bands ──────
+        # (fit.bootstrap.save_path npy — used whether or not the bootstrap
+        # refit ran this session, so plot-only skip_minimization reruns get
+        # the same bands as the original fit)
+        boot_par_samples = None
+        _bs_path = (self.config.get("fit", {}).get("bootstrap") or {}) \
+            .get("save_path")
+        if _bs_path and os.path.exists(_bs_path):
+            try:
+                _bs_arr = np.load(_bs_path)
+                if _bs_arr.ndim == 2 and _bs_arr.shape[1] == len(par):
+                    boot_par_samples = _bs_arr
+                    self._log(logging.INFO,
+                              "plot bands: %d bootstrap parameter samples "
+                              "from %s", len(boot_par_samples), _bs_path)
+                else:
+                    self._log(logging.WARNING,
+                              "plot bands: %s has shape %s, expected (N, %d) "
+                              "— ignoring", _bs_path, _bs_arr.shape, len(par))
+            except Exception as _e:
+                self._log(logging.WARNING,
+                          "plot bands: could not load %s (%s)", _bs_path, _e)
 
         # ── multi-channel phase shift plot ────────────────────────────────────
         ps_cfg = plot_cfg.get("phase_shifts", {})
         if ps_cfg.get("enabled", True):
-            ps_save = ps_cfg.get(
+            ps_save = self._apply_figures_dir(ps_cfg.get(
                 "save_path",
                 f"./figures/{self.study_module_name}_phase_shifts.pdf",
-            ).replace("{study_module}", self.study_module_name)
-            fit_plots.plot_phase_shifts_multichannel(
-                self.study,
+            ).replace("{study_module}", self.study_module_name))
+            # mixing_convention: "bb" (Blatt-Biedenharn eigenphases, as
+            # parametrized), "bar" (Stapp bar phases — Nijmegen/SAID
+            # convention, converted via bb_to_bar), or "both" (two figures;
+            # the bar one gets a "_bar" suffix).
+            _mix = str(ps_cfg.get("mixing_convention", "bb")).strip().lower()
+            _convs = ["bb", "bar"] if _mix == "both" else [_mix]
+            for _conv in _convs:
+                _save = ps_save
+                if _mix == "both" and _conv == "bar":
+                    _root, _ext = os.path.splitext(ps_save)
+                    _save = f"{_root}_bar{_ext or '.pdf'}"
+                self.study.plot_phase_shifts_multichannel(
+                    par,
+                    vijmat,
+                    data2cm,
+                    kept_mom2,
+                    kept_irreps,
+                    kept_levels,
+                    mL           = massN[0] * lattice_size,
+                    MN           = mass_n,
+                    MK           = mass_k,
+                    ecm_min      = float(ps_cfg["ecm_min"]) if "ecm_min" in ps_cfg else None,
+                    ecm_max      = float(ps_cfg["ecm_max"]) if "ecm_max" in ps_cfg else None,
+                    n_sweep      = int(ps_cfg.get("n_sweep", 500)),
+                    save_path    = _save,
+                    show         = bool(ps_cfg.get("show", False)),
+                    mN_samples   = massN,
+                    L_lattice    = lattice_size,
+                    n_par_samples= int(ps_cfg.get("n_par_samples", 400)),
+                    par_samples  = boot_par_samples,
+                    mixing_convention = _conv,
+                    figsize      = tuple(ps_cfg["figsize"]) if "figsize" in ps_cfg else (10, 8),
+                    show_level_labels = bool(ps_cfg.get("show_level_labels", True)),
+                    bottom_ylabel = ps_cfg.get("bottom_ylabel", "levels"),
+                    label_fontsize = ps_cfg.get("label_fontsize"),
+                    legend_loc   = ps_cfg.get("legend_loc", "lower left"),
+                    pie_size     = float(ps_cfg.get("pie_size", 220.0)),
+                )
+                self._log(logging.INFO, "Phase shift plot saved (%s): %s",
+                          _conv, _save)
+
+        # ── det / eigenvalue diagnostic plot ─────────────────────────────────
+        # JSON: "plot": { "det_diagnostics": { "enabled": true, ... } }
+        det_cfg     = plot_cfg.get("det_diagnostics", {})
+        det_enabled = bool(det_cfg.get("enabled", True))   # on by default
+        if det_enabled:
+            diag_save_path = det_cfg.get("save_dir")
+            if diag_save_path:
+                diag_save_path = self._apply_figures_dir(diag_save_path)
+            else:
+                diag_save_path = (self._apply_figures_dir(None, as_dir=True)
+                                  or f"./figures/{self.study_module_name}")
+            self._log(logging.INFO, "Plotting det/eigenvalue diagnostics → %s", diag_save_path)
+            self.study.plot_omega_and_eigenvalues(
                 par,
                 vijmat,
+                kept_mom2,
+                kept_irreps,
+                kept_levels,
+                data2cm,
+                framesall,
+                irrepsall,
+                levelsall,
+                mL          = massN[0] * lattice_size,
+                MN          = mass_n,
+                MK          = mass_k,
+                n_refine    = n_refine,
+                n_sweep     = int(det_cfg.get("n_sweep", 1000)),
+                save_dir    = diag_save_path,
+                show        = bool(det_cfg.get("show", False)),
+                eig_ylim    = tuple(det_cfg.get("eig_ylim", [-0.5, 0.5])),
+                mN_samples  = massN[1:],
+                L           = lattice_size,
+                n_par_samples = int(det_cfg.get("n_par_samples", 400)),
+                step_mode   = step_mode,
+                mN_err      = mN_err,
+            )
+        else:
+            self._log(logging.INFO, "det_diagnostics disabled — skipping")
+
+        # ── per-wave predicted energies (single-wave solo spectra) ────────────
+        # JSON: "plot": { "wave_energies": { "enabled": true,
+        #                 "n_par_samples": 60, "save_path": ... } }
+        # At the best-fit parameters, the QC roots of each partial wave in
+        # isolation per irrep(P²), next to data and the full-model roots, with
+        # σ68 error bars from bootstrap parameter samples (fit.bootstrap
+        # save_path npy if present) or Gaussian vij draws as fallback.
+        we_cfg = plot_cfg.get("wave_energies", {})
+        if bool(we_cfg.get("enabled", True)):
+            we_save = self._apply_figures_dir(we_cfg.get(
+                "save_path",
+                f"./figures/{self.study_module_name}_wave_energies.pdf",
+            ).replace("{study_module}", self.study_module_name))
+            we_nsamp = int(we_cfg.get("n_par_samples", 60))
+            par_samples = boot_par_samples
+            if par_samples is None and vijmat is not None:
+                try:
+                    par_samples = np.random.default_rng(0).multivariate_normal(
+                        np.asarray(par, dtype=float),
+                        np.asarray(vijmat, dtype=float), we_nsamp)
+                    self._log(logging.INFO,
+                              "wave_energies: %d Gaussian vij draws "
+                              "(no bootstrap npy found)", we_nsamp)
+                except Exception as _e:
+                    self._log(logging.WARNING,
+                              "wave_energies: vij draws failed (%s) — "
+                              "no error bars on predictions", _e)
+            # "rcparams": {...} — matplotlib settings for this figure only.
+            # The plot reads marker and font sizes from rcParams, so this is
+            # what lets a paper figure be drawn at its final on-page size with
+            # readable markers/labels (cf. scripts/make_paper_figures.py).
+            we_rc = we_cfg.get("rcparams", {}) or {}
+            with plt.rc_context(we_rc):
+                _we_res = self.study.plot_wave_predicted_energies(
+                    par, data2cm, kept_mom2, kept_irreps, kept_levels,
+                    mL           = massN[0] * lattice_size,
+                    MN           = mass_n,
+                    MK           = mass_k,
+                    par_samples  = par_samples,
+                    n_par_samples= we_nsamp,
+                    n_refine     = n_refine,
+                    step_mode    = step_mode,
+                    save_path    = we_save,
+                    show         = bool(we_cfg.get("show", False)),
+                    title        = we_cfg.get("title",
+                                              f"{self.study_module_name}: "
+                                              "per-wave predicted energies"),
+                    # inherit the spectrum plot's y-axis label so the two figures
+                    # read as one series (per-figure override still possible)
+                    ylabel       = we_cfg.get("ylabel", plot_cfg.get("ylabel")),
+                    y_from_data  = bool(we_cfg.get("y_from_data", True)),
+                    y_top_pad    = float(we_cfg.get("y_top_pad", 0.08)),
+                    y_bottom_pad = float(we_cfg.get("y_bottom_pad", 0.05)),
+                    show_legend  = bool(we_cfg.get("show_legend", True)),
+                    show_level_labels=bool(we_cfg.get("show_level_labels", False)),
+                    figsize      = (tuple(we_cfg["figsize"])
+                                    if isinstance(we_cfg.get("figsize"), list)
+                                    and len(we_cfg["figsize"]) == 2 else None),
+                )
+            self._log(logging.INFO, "Wave-energy plot saved: %s", we_save)
+            # how big are the prediction error bars actually? (they are often
+            # smaller than the marker, which reads as "no error bars")
+            try:
+                # results[(psq, irrep)]["model"] = (energies, sigmas)
+                _sig = []
+                for _blk in (_we_res or {}).values():
+                    _m = _blk.get("model")
+                    if isinstance(_m, (tuple, list)) and len(_m) > 1 and _m[1] is not None:
+                        _sig.extend(np.atleast_1d(_m[1]).ravel().tolist())
+                _sig = np.asarray([x for x in _sig if np.isfinite(x)], dtype=float)
+                if _sig.size:
+                    self._log(logging.INFO,
+                              "wave_energies: full-model root sigma over "
+                              "parameter samples — median %.2e, max %.2e "
+                              "(in E*/m_ref); marker half-height is ~%.1e",
+                              float(np.median(_sig)), float(_sig.max()), 3e-4)
+            except Exception as _e:
+                self._log(logging.DEBUG, "sigma summary failed: %s", _e)
+            # optional JSON dump of the per-block numbers, so a paper figure
+            # can be redrawn without re-solving the quantization condition
+            _dump = we_cfg.get("dump_path")
+            if _dump:
+                try:
+                    _out = {}
+                    for (_psq, _irr), _r in (_we_res or {}).items():
+                        _d_e, _d_s = _r["data"]
+                        _m_e, _m_s = _r["model"]
+                        _out[f"{_psq}|{_irr}"] = {
+                            "window": [float(x) for x in _r["window"]],
+                            "ni":     [float(x) for x in np.atleast_1d(_r["ni"])],
+                            "levels": [int(x) for x in _r.get("levels", [])],
+                            "data":   [[float(x) for x in np.atleast_1d(_d_e)],
+                                       [float(x) for x in np.atleast_1d(_d_s)]],
+                            "model":  [[float(x) for x in np.atleast_1d(_m_e)],
+                                       [float(x) for x in np.atleast_1d(_m_s)]],
+                            "solo":   {str(_k): [[float(x) for x in np.atleast_1d(_v[0])],
+                                                 [float(x) for x in np.atleast_1d(_v[1])]]
+                                       for _k, _v in _r["solo"].items()},
+                        }
+                    os.makedirs(os.path.dirname(os.path.abspath(_dump)), exist_ok=True)
+                    with open(_dump, "w") as _fh:
+                        json.dump(_out, _fh, indent=1)
+                    self._log(logging.INFO, "wave_energies: dumped %d blocks -> %s",
+                              len(_out), _dump)
+                except Exception as _e:
+                    self._log(logging.WARNING, "wave_energies dump failed: %s", _e)
+        else:
+            self._log(logging.INFO, "wave_energies disabled — skipping")
+
+        # ── QC null-eigenvector wave decomposition ────────────────────────────
+        # JSON: "plot": { "eigenvector_decomposition": { "enabled": false, ... } }
+        eigvec_cfg    = plot_cfg.get("eigenvector_decomposition", {})
+        eigvec_on     = bool(eigvec_cfg.get("enabled", False))   # off by default
+        eigvec_method = str(eigvec_cfg.get("method", "eigh"))
+        eigvec_nr     = int(eigvec_cfg.get("n_refine", n_refine))
+
+        if eigvec_on:
+            self._log(logging.INFO, "%s", "~ " * 20)
+            self._log(logging.INFO,
+                      "Computing QC null-eigenvector decomposition (method=%s)...",
+                      eigvec_method)
+            decomp_results = self.study.eigenvector_decomposition(
+                par,
                 data2cm,
                 kept_mom2,
                 kept_irreps,
                 kept_levels,
-                mL           = massN[0] * lattice_size,
-                MN           = mass_n,
-                MK           = mass_k,
-                ecm_min      = float(ps_cfg["ecm_min"]) if "ecm_min" in ps_cfg else None,
-                ecm_max      = float(ps_cfg["ecm_max"]) if "ecm_max" in ps_cfg else None,
-                n_sweep      = int(ps_cfg.get("n_sweep", 500)),
-                save_path    = ps_save,
-                show         = bool(ps_cfg.get("show", False)),
-                mN_samples   = massN,
-                L_lattice    = lattice_size,
-                n_par_samples= int(ps_cfg.get("n_par_samples", 400)),
+                mL        = massN[0] * lattice_size,
+                MN        = mass_n,
+                MK        = mass_k,
+                n_refine  = eigvec_nr,
+                step_mode = step_mode,
+                method    = eigvec_method,
             )
-            self._log(logging.INFO, "Phase shift plot saved: %s", ps_save)
-
-        # ── det diagonistic plot ──────────────────────────────────────────────────
-        diag_save_path = f"./Figures/{self.study_module_name}/det_lambdas.pdf"
-        fit_plots.plot_omega_and_eigenvalues(
-            self.study,
-            par,
-            vijmat,
-            kept_mom2,
-            kept_irreps,
-            kept_levels,
-            data2cm,
-            framesall,       # ← already built earlier in run()
-            irrepsall,       # ← already built earlier in run()
-            levelsall,       # ← already built earlier in run()
-            mL        = massN[0] * lattice_size,
-            MN        = mass_n,
-            MK        = mass_k,
-            n_refine  = n_refine,
-            n_sweep   = 1000,
-            save_dir  = diag_save_path,
-            show      = False,
-            eig_ylim  = (-0.5, 0.5),
-            mN_samples=massN[1:],
-            L= lattice_size,
-            n_par_samples = 400,
-            step_mode = step_mode,
-            mN_err    = mN_err,
-        )
-        
-        # ── QC null-eigenvector wave decomposition (always runs for multi-wave fits)
-        eigvec_cfg      = plot_cfg.get("eigenvector_decomposition", {})
-        eigvec_n_refine = int(eigvec_cfg.get("n_refine", 100))
-        self._log(logging.INFO, "%s", "~ " * 20)
-        self._log(logging.INFO, "Computing QC null-eigenvector decomposition...")
-        decomp_results = self.study.eigenvector_decomposition(
-            par,
-            data2cm,
-            kept_mom2,
-            kept_irreps,
-            mL        = massN[0] * lattice_size,
-            MN        = mass_n,
-            MK        = mass_k,
-            n_refine  = eigvec_n_refine,
-            step_mode = step_mode,
-        )
-        fit_plots.print_eigenvector_decomposition(
-            decomp_results,
-            log_fn=lambda msg: self._log(logging.INFO, "%s", msg),
-        )
-        if eigvec_cfg.get("plot", False) and decomp_results:
-            eigvec_save_path = eigvec_cfg.get(
-                "save_path",
-                f"./figures/{self.study_module_name}/eigenvector_decomposition.pdf",
-            )
-            fit_plots.plot_eigenvector_decomposition(
-                self.study,
+            pt.print_eigenvector_decomposition(
                 decomp_results,
-                save_path = eigvec_save_path,
-                show      = bool(eigvec_cfg.get("show", False)),
-                title     = eigvec_cfg.get("title", None),
+                log_fn=lambda msg: self._log(logging.INFO, "%s", msg),
             )
-            self._log(logging.INFO, "Eigenvector decomposition plot saved: %s", eigvec_save_path)
+            if eigvec_cfg.get("plot", False) and decomp_results:
+                eigvec_save = self._apply_figures_dir(eigvec_cfg.get(
+                    "save_path",
+                    f"./figures/{self.study_module_name}/eigenvector_decomposition.pdf",
+                ))
+                pt.plot_eigenvector_decomposition(
+                    self.study,
+                    decomp_results,
+                    save_path = eigvec_save,
+                    show      = bool(eigvec_cfg.get("show", False)),
+                    title     = eigvec_cfg.get("title", None),
+                )
+                self._log(logging.INFO,
+                          "Eigenvector decomposition plot saved: %s", eigvec_save)
+        else:
+            self._log(logging.INFO, "eigenvector_decomposition disabled — skipping")
 
-        # ── fit comparison plot (multiple parametrizations) ──────────────────
-        comp_cfg = plot_cfg.get("fit_comparison", {})
-        if comp_cfg.get("enabled", False):
+        # ── fit comparison / kcotδ-vs-p² plot ─────────────────────────────────
+        # On by default: with no "fits" list it draws the current best fit
+        # alone (the per-run q·cotδ plot). Provide "fits" to overlay several
+        # parameter sets.
+        # "fit_comparison" is the pre-rename key, still honoured.
+        comp_cfg = plot_cfg.get("luscher", plot_cfg.get("fit_comparison", {}))
+        if comp_cfg.get("enabled", True):
             fits_list = comp_cfg.get("fits", [])
             if not fits_list:
-                self._log(logging.WARNING, "fit_comparison enabled but no fits provided")
-            else:
-                comp_save = comp_cfg.get(
-                    "save_path",
-                    f"./figures/{self.study_module_name}/fit_comparison.pdf"
-                )
-                self._log(logging.INFO, "Plotting fit comparison with %d parameter sets...", len(fits_list))
-                
-                # Each fit dict should have: label, params, color (opt), linestyle (opt)
-                for idx, fit_spec in enumerate(fits_list):
-                    if 'params' not in fit_spec:
-                        self._log(logging.WARNING, "  Fit %d missing 'params' key, skipping", idx+1)
-                        continue
-                    label = fit_spec.get('label', f'Fit {idx+1}')
-                    self._log(logging.INFO, "  %s: params=%s", label, fit_spec['params'])
-                
-                fit_plots.plot_fit_comparison(
-                    self.study,
-                    fits           = fits_list,
-                    data2cm        = data2cm,
-                    kept_mom2      = kept_mom2,
-                    kept_irreps    = kept_irreps,
-                    kept_levels    = kept_levels,
-                    mL             = massN[0] * lattice_size,
-                    MN             = mass_n,
-                    MK             = mass_k,
-                    ecm_min        = float(comp_cfg.get("ecm_min")) if "ecm_min" in comp_cfg else None,
-                    ecm_max        = float(comp_cfg.get("ecm_max")) if "ecm_max" in comp_cfg else None,
-                    n_sweep        = int(comp_cfg.get("n_sweep", 800)),
-                    clip           = float(comp_cfg.get("clip", 30.0)),
-                    show_errorbars = bool(comp_cfg.get("show_errorbars", True)),
-                    save_path      = comp_save,
-                    show           = bool(comp_cfg.get("show", False)),
-                    cov            = covp2,
-                    data_central   = datap2[:, 0],
-                    frames_all     = framesall,
-                    irreps_all     = irrepsall,
-                    levels_all     = levelsall,
-                )
-                self._log(logging.INFO, "Fit comparison plot saved: %s", comp_save)
-                
-                # Collect labels for the congratulatory message
-                labels = [fit.get('label', f'Fit {i+1}') for i, fit in enumerate(fits_list)]
-                labels_str = ', '.join(labels)
-                
-                # Print congratulatory message and exit
-                print("\n" + "=" * 60)
-                print("We made the fit comparison for these:")
-                print(f"  {labels_str}")
-                print("Congrats!")
-                print("=" * 60 + "\n")
-                
-                self._log(logging.INFO, "Fit comparison complete. Exiting without running minimization.")
-                return  # Exit early, skip minimization
+                # error band: bootstrap samples if available, else vij draws
+                fits_list = [{"label": "best fit",
+                              "params": [float(x) for x in par],
+                              "chi2_dof": (chi2_val / dof) if dof else None,
+                              "vij": vijmat,
+                              "par_samples": boot_par_samples,
+                              "n_par_samples": int(comp_cfg.get(
+                                  "n_par_samples", 200))}]
+            comp_save = self._apply_figures_dir(comp_cfg.get(
+                "save_path",
+                f"./figures/{self.study_module_name}/luscher.pdf"
+            ))
+            self._log(logging.INFO, "Plotting Lüscher kcotδ plot with %d parameter sets...", len(fits_list))
+
+            # Each fit dict should have: label, params, color (opt), linestyle (opt)
+            for idx, fit_spec in enumerate(fits_list):
+                if 'params' not in fit_spec:
+                    self._log(logging.WARNING, "  Fit %d missing 'params' key, skipping", idx+1)
+                    continue
+                label = fit_spec.get('label', f'Fit {idx+1}')
+                self._log(logging.INFO, "  %s: params=%s", label, fit_spec['params'])
+
+            self.study.plot_luscher(
+                fits           = fits_list,
+                data2cm        = data2cm,
+                kept_mom2      = kept_mom2,
+                kept_irreps    = kept_irreps,
+                kept_levels    = kept_levels,
+                mL             = massN[0] * lattice_size,
+                MN             = mass_n,
+                MK             = mass_k,
+                ecm_min        = float(comp_cfg.get("ecm_min")) if "ecm_min" in comp_cfg else None,
+                ecm_max        = float(comp_cfg.get("ecm_max")) if "ecm_max" in comp_cfg else None,
+                n_sweep        = int(comp_cfg.get("n_sweep", 800)),
+                clip           = float(comp_cfg.get("clip", 30.0)),
+                show_errorbars = bool(comp_cfg.get("show_errorbars", True)),
+                save_path      = comp_save,
+                show           = bool(comp_cfg.get("show", False)),
+                cov            = covp2,
+                data_central   = datap2[:, 0],
+                frames_all     = framesall,
+                irreps_all     = irrepsall,
+                levels_all     = levelsall,
+                show_level_labels=bool(comp_cfg.get("show_level_labels", False)),
+            )
+            self._log(logging.INFO, "Lüscher plot saved: %s", comp_save)
+        else:
+            self._log(logging.INFO, "luscher disabled — skipping")
         
         # self.study.plot_box_quantization_diagnostics(
         #     par,
@@ -1582,398 +1928,6 @@ def main():
     finally:
         # Ensure no interactive figures remain alive between repeated runs.
         plt.close("all")
-
-
-doc = '''
-HPW fit task using GenericFitRunner and B-matrix (BMAT) approach.
-
-Two usage modes:
-
-1. config_file mode – point to a pre-made GenericFitRunner JSON:
-     single_channel_fit:
-       config_file: path/to/fit.json
-       study_module: QC2.my_fit_model   # optional
-       bmat_preview_only: false          # optional
-
-2. Auto-config mode – build the JSON automatically from previous task output.
-   twoJ, L (partial wave), and twoS are derived from the particle names in
-   general/particles.py.  Only the K-matrix initial guesses need to be set:
-
-     single_channel_fit:
-       data_file: /path/to/spectrum.hdf5   # omit to auto-discover from project dir
-
-       scattering:
-         'N(0)_ref,pi(0)_ref':
-           PSQ0:
-             - G1u: [0, 1]
-           PSQ1:
-             - G1: [0, 1]
-
-       # Quantum numbers – twoS auto-derived from particles.py
-       # twoJ defaults to |2L - twoS| (minimum J); override if needed.
-       L:       0              # partial wave: 0=S, 1=P, 2=D, ...
-       k_matrix: polynomial   # polynomial | ERE | zero | coupled
-       params:               # K-matrix initial guesses (required)
-         - {name: c0, initial: -0.2}
-         - {name: c1, initial: 0.7}
-       # Optional overrides (normally auto-derived):
-       # twoS: 1
-       # twoJ: 1
-
-       # fit settings (all optional – defaults shown)
-       MN: 1.0
-       MK: 1.0
-       strategy: nelder-mead
-       n_starts: 20
-       n_refine: 400
-       auto_p0: false
-       cutoff: 10.0
-       study_module: QC2.my_fit_model
-       bmat_preview_only: false   # set true to only plot B-matrix preview
-'''
-
-# Partial-wave label → integer L
-_WAVE_LABEL_TO_L = {'S': 0, 'P': 1, 'D': 2, 'F': 3, 'G': 4, 'H': 5, 'I': 6}
-_L_TO_WAVE_LABEL = {v: k for k, v in _WAVE_LABEL_TO_L.items()}
-
-# Momentum vector for each PSQ label / integer – mirrors GenericFitRunner
-_PSQ_TO_MOMENTUM = {
-    'PSQ0': [0, 0, 0], 0: [0, 0, 0],
-    'PSQ1': [0, 0, 1], 1: [0, 0, 1],
-    'PSQ2': [1, 1, 0], 2: [1, 1, 0],
-    'PSQ3': [1, 1, 1], 3: [1, 1, 1],
-    'PSQ4': [0, 0, 2], 4: [0, 0, 2],
-}
-
-
-def _parse_particle_base(part_str):
-    """Extract base particle name from strings like 'N(0)_ref' → 'N'."""
-    name = part_str.strip()
-    for sep in ('(', '_'):
-        if sep in name:
-            name = name.split(sep)[0]
-            break
-    return name
-
-
-def _infer_channel_qn(channel_str, task_params):
-    """Infer a quantum_numbers channel dict from the scattering channel string.
-
-    Particle spins are read from ``general.particles.particles``.
-    ``twoS`` is computed (or warned about if ambiguous).
-    ``L`` comes from ``task_params['L']`` (default 0 = S-wave).
-    ``twoJ`` defaults to ``|2L - twoS|`` (minimum J); override via ``task_params['twoJ']``.
-
-    Returns a channel dict on success, or ``None`` if any particle is unknown.
-    """
-    try:
-        from general.particles import particles as PARTICLES
-    except ImportError:
-        logging.warning("HPWFitTask: could not import general.particles – quantum numbers not auto-inferred.")
-        return None
-
-    parts = [p.strip() for p in channel_str.split(',')]
-    particle_bases = [_parse_particle_base(p) for p in parts]
-
-    spins = []
-    for pname in particle_bases:
-        if pname in PARTICLES:
-            spins.append(float(PARTICLES[pname]['spin']))
-        else:
-            logging.warning(f"HPWFitTask: unknown particle '{pname}' – quantum numbers not auto-inferred.")
-            return None
-
-    if len(spins) != 2:
-        return None
-
-    twoS_max = int(round(2 * (spins[0] + spins[1])))
-    twoS_min = int(round(2 * abs(spins[0] - spins[1])))
-
-    # twoS: use explicit value or auto-select
-    twoS = int(task_params['twoS']) if (task_params and 'twoS' in task_params) else None
-    if twoS is None:
-        if twoS_min == twoS_max:
-            twoS = twoS_min
-        else:
-            twoS = twoS_min
-            logging.warning(
-                f"HPWFitTask: channel '{channel_str}' has multiple spin states "
-                f"(twoS = {twoS_min} … {twoS_max}). Defaulting to twoS={twoS}. "
-                "Add 'twoS' to task params to override."
-            )
-
-    # L: accept integer or spectroscopic letter ('S','P','D',...)
-    L_raw = task_params.get('L', 0) if task_params else 0
-    if isinstance(L_raw, str):
-        L = _WAVE_LABEL_TO_L.get(L_raw.upper(), 0)
-    else:
-        L = int(L_raw)
-
-    # twoJ: explicit or minimum J = |2L - twoS|
-    twoJ = int(task_params['twoJ']) if (task_params and 'twoJ' in task_params) else abs(2 * L - twoS)
-
-    wave_str = f"{twoS + 1}{_L_TO_WAVE_LABEL.get(L, str(L))}{twoJ}"
-    channel_name = '_'.join(particle_bases) + f'_{wave_str}'
-
-    k_matrix = task_params.get('k_matrix', 'polynomial') if task_params else 'polynomial'
-    params   = task_params.get('params', []) if task_params else []
-
-    if not params:
-        logging.warning(
-            f"HPWFitTask: no 'params' (K-matrix initial guesses) given for channel "
-            f"'{channel_str}'. Add them to task params, e.g.:\n"
-            "  params:\n    - {name: c0, initial: -0.2}\n    - {name: c1, initial: 0.7}"
-        )
-
-    qn_channel = {
-        "name":     channel_name,
-        "twoJ":     twoJ,
-        "L":        L,
-        "Lp":       L,
-        "twoS":     twoS,
-        "enabled":  True,
-        "k_matrix": k_matrix,
-    }
-    if params:
-        qn_channel["params"] = params
-
-    logging.info(
-        f"HPWFitTask: inferred quantum numbers for '{channel_str}': "
-        f"twoS={twoS}, L={L} ({_L_TO_WAVE_LABEL.get(L,'?')}-wave), twoJ={twoJ} → {wave_str}"
-    )
-    return qn_channel
-
-
-def _find_hpw_hdf5(task_params, proj_handler):
-    """Return the HDF5 input path.
-
-    Priority:
-      1. Explicit ``data_file`` in task_params.
-      2. Most-recently-modified .hdf5/.h5 in the fit_spectrum data directory.
-      3. Most-recently-modified .hdf5/.h5 anywhere under the project root.
-    """
-    if task_params and task_params.get('data_file'):
-        return task_params['data_file']
-
-    # Try fit_spectrum task data directory first
-    for task_name in ('fit_spectrum', 'single_channel_fit'):
-        handler = proj_handler.all_tasks.get(task_name)
-        if handler:
-            search_root = handler.data_dir()
-            candidates = (
-                glob.glob(os.path.join(search_root, '**', '*.hdf5'), recursive=True)
-                + glob.glob(os.path.join(search_root, '**', '*.h5'), recursive=True)
-            )
-            if candidates:
-                candidates.sort(key=os.path.getmtime, reverse=True)
-                logging.info(f"HPWFitTask: auto-discovered HDF5 from '{task_name}': {candidates[0]}")
-                return candidates[0]
-
-    # Fall back to project root
-    candidates = (
-        glob.glob(os.path.join(proj_handler.root, '**', '*.hdf5'), recursive=True)
-        + glob.glob(os.path.join(proj_handler.root, '**', '*.h5'), recursive=True)
-    )
-    if candidates:
-        candidates.sort(key=os.path.getmtime, reverse=True)
-        logging.info(f"HPWFitTask: auto-discovered HDF5 from project root: {candidates[0]}")
-        return candidates[0]
-
-    raise FileNotFoundError(
-        "HPWFitTask: could not find an HDF5 input file. "
-        "Add 'data_file' to the task params or ensure a previous task (fit_spectrum) "
-        "has written an HDF5 file to the project data directory."
-    )
-
-
-def _build_data_block(task_params):
-    """Convert the YAML 'scattering' dict into a GenericFitRunner 'data' list.
-
-    The scattering format is:
-        scattering:
-          'channel_name':
-            PSQ0:
-              - IrrepName: [level_indices, ...]
-            PSQ1:
-              - IrrepName: [level_indices, ...]
-
-    Returns a list like:
-        [{"momentum": [0,0,0], "irreps": {"G1u": [0,1]}}, ...]
-    one entry per PSQ with all irreps merged across channels.
-    """
-    scattering = task_params.get('scattering') if task_params else None
-    if not scattering:
-        return None
-
-    # Merge irreps/levels from all channels, keyed by PSQ label
-    psq_merged = {}  # PSQ_label -> {irrep: [levels]}
-    for _channel, psq_dict in scattering.items():
-        for psq_label, irrep_list in psq_dict.items():
-            if psq_label not in psq_merged:
-                psq_merged[psq_label] = {}
-            # irrep_list is a list containing one dict: [{IrrepName: [levels]}]
-            for irrep_entry in irrep_list:
-                if isinstance(irrep_entry, dict):
-                    for irrep_name, levels in irrep_entry.items():
-                        if irrep_name not in psq_merged[psq_label]:
-                            psq_merged[psq_label][irrep_name] = []
-                        for lvl in levels:
-                            if lvl not in psq_merged[psq_label][irrep_name]:
-                                psq_merged[psq_label][irrep_name].append(lvl)
-
-    # Sort by PSQ so the data block is in ascending momentum order
-    data_block = []
-    for psq_label in sorted(psq_merged.keys()):
-        momentum = _PSQ_TO_MOMENTUM.get(psq_label)
-        if momentum is None:
-            logging.warning(f"HPWFitTask: unknown PSQ label '{psq_label}', skipping.")
-            continue
-        data_block.append({
-            "momentum": momentum,
-            "irreps": {k: sorted(v) for k, v in psq_merged[psq_label].items()},
-        })
-
-    return data_block
-
-
-def _build_hpw_config(task_params, proj_handler, general_configs):
-    """Build a complete GenericFitRunner config dict from PyCALQ task params."""
-    # ── HDF5 file ──────────────────────────────────────────────────────────
-    h5_file = _find_hpw_hdf5(task_params, proj_handler)
-
-    # ── Lattice size from sigmond ensemble info ────────────────────────────
-    lattice_size = int(task_params.get('lattice_size', 48))
-    try:
-        import fvspectrum.sigmond_util as sigmond_util
-        ensemble_info = sigmond_util.get_ensemble_info(general_configs)
-        lattice_size = int(ensemble_info.getLatticeXExtent())
-    except Exception:
-        pass  # fall back to task_params value or default
-
-    # ── Data block from scattering YAML ───────────────────────────────────
-    data_block = _build_data_block(task_params)
-
-    # ── Quantum numbers: explicit block wins; otherwise infer from particles.py ─
-    qn_block = task_params.get('quantum_numbers', None) if task_params else None
-    if qn_block is None and scattering:
-        inferred_channels = []
-        for channel_str in scattering.keys():
-            ch = _infer_channel_qn(channel_str, task_params)
-            if ch:
-                inferred_channels.append(ch)
-        qn_block = {"channels": inferred_channels} if inferred_channels else {}
-    elif qn_block is None:
-        qn_block = {}
-
-    # ── Output paths via project directory handler ─────────────────────────
-    plot_dir = proj_handler.plot_dir()
-    log_dir  = proj_handler.log_dir()
-
-    config = {
-        "study_module": task_params.get('study_module', 'QC2.my_fit_model'),
-        "input": {
-            "file":         h5_file,
-            "lattice_size": lattice_size,
-            "continuum":    bool(task_params.get('continuum', True)),
-            "cutoff":       float(task_params.get('cutoff', 10.0)),
-        },
-        "quantum_numbers": qn_block,
-        "fit": {
-            "MN":                float(task_params.get('MN', 1.0)),
-            "MK":                float(task_params.get('MK', 1.0)),
-            "strategy":          task_params.get('strategy', 'nelder-mead'),
-            "n_starts":          int(task_params.get('n_starts', 20)),
-            "n_refine":          int(task_params.get('n_refine', 400)),
-            "step_mode":         task_params.get('step_mode', 'adaptive'),
-            "xatol":             float(task_params.get('xatol', 1e-6)),
-            "fatol":             float(task_params.get('fatol', 1e-6)),
-            "n_maxiter":         int(task_params.get('n_maxiter', 10000)),
-            "auto_p0":           bool(task_params.get('auto_p0', False)),
-            "skip_minimization": bool(task_params.get('skip_minimization', False)),
-        },
-        "plot": {
-            "enabled":            True,
-            "save_path":          os.path.join(plot_dir, "hpw_fit_spectrum.pdf"),
-            "save_timestamp":     True,
-            "com_frame":          True,
-            "show":               False,
-            "ylabel":             r"$E^\star / m_N$",
-            "show_ni":            True,
-            "show_level_labels":  True,
-            "bmatrix_preview": {
-                "enabled":      bool(task_params.get('bmat_preview_only', False)),
-                "save_path":    os.path.join(plot_dir, "bmatrix_preview.pdf"),
-                "n_sweep":      int(task_params.get('bmat_n_sweep', 800)),
-                "clip":         float(task_params.get('bmat_clip', 30.0)),
-                "y_scale_mode": task_params.get('bmat_y_scale_mode', 'data_central'),
-                "show":         False,
-            },
-        },
-        "logging": {
-            "enabled": True,
-            "dir":     log_dir,
-            "prefix":  "hpw_fit",
-            "level":   "INFO",
-        },
-    }
-
-    if data_block:
-        config["data"] = data_block
-
-    return config
-
-
-class HPWFitTask:
-    """Adapts GenericFitRunner to the PyCALQ task interface.
-
-    Supports two modes (see module ``doc`` string for YAML examples):
-
-    1. **config_file mode**: provide ``config_file`` in task_params pointing to a
-       pre-made GenericFitRunner JSON.  The JSON is used as-is.
-
-    2. **auto-config mode**: omit ``config_file`` and instead provide ``data_file``
-       (or rely on auto-discovery from the project directory) plus ``scattering``
-       and optionally ``quantum_numbers``.  A JSON config is generated
-       automatically and saved to the task log directory.
-    """
-
-    @property
-    def info(self):
-        return doc
-
-    def __init__(self, task_name, proj_handler, general_configs, task_params):
-        self.task_name = task_name
-        self.proj_handler = proj_handler
-
-        if task_params and 'config_file' in task_params:
-            # ── Mode 1: pre-made JSON ──────────────────────────────────────
-            config_path = task_params['config_file']
-            logging.info(f"HPWFitTask: using provided config_file: {config_path}")
-        else:
-            # ── Mode 2: auto-generate JSON from task params + project dir ──
-            logging.info("HPWFitTask: no config_file provided – auto-generating JSON config.")
-            config_dict = _build_hpw_config(task_params or {}, proj_handler, general_configs)
-            config_path = os.path.join(proj_handler.log_dir(), 'hpw_fit_config.json')
-            with open(config_path, 'w', encoding='utf-8') as f:
-                json.dump(config_dict, f, indent=2)
-            logging.info(f"HPWFitTask: auto-generated config written to {config_path}")
-
-        study_module      = (task_params or {}).get('study_module', None)
-        bmat_preview_only = bool((task_params or {}).get('bmat_preview_only', False))
-
-        self._runner = GenericFitRunner(
-            config_path,
-            study_module_override=study_module,
-            bmat_preview_only=bmat_preview_only,
-        )
-
-    def run(self):
-        """Run the HPW fit (GenericFitRunner handles internal plotting)."""
-        self._runner.run()
-
-    def plot(self):
-        """Plotting is handled inside run(); intentional no-op."""
-        pass
 
 
 if __name__ == "__main__":

@@ -4,15 +4,25 @@ import general.task_manager as tm
 import general.config_handler as ch
 import general.project_directory as pd
 
-import fvspectrum.sigmond_project_handler as sph
-import fvspectrum.sigmond_view_corrs
-import fvspectrum.sigmond_average_corrs
-import fvspectrum.sigmond_rotate_corrs
-import fvspectrum.sigmond_spectrum_fits
-# import fvspectrum.generate_toy_correlators
-import fvspectrum.compare_sigmond_levels
-import QC2.single_channel_fit_mean
-import QC2.run_HPW_fit
+# The correlator-analysis tasks need sigmond (and pylatex for the summary
+# documents). The Luscher fit in QC2 needs neither -- it starts from an HDF5
+# spectrum -- so a missing sigmond disables only the fvspectrum tasks instead
+# of preventing PyCALQ from running at all.
+try:
+    import fvspectrum.sigmond_project_handler as sph
+    import fvspectrum.sigmond_view_corrs
+    import fvspectrum.sigmond_average_corrs
+    import fvspectrum.sigmond_rotate_corrs
+    import fvspectrum.sigmond_spectrum_fits
+    # import fvspectrum.generate_toy_correlators
+    import fvspectrum.compare_sigmond_levels
+    SIGMOND_AVAILABLE = True
+except ImportError as _sigmond_err:
+    sph = None
+    SIGMOND_AVAILABLE = False
+    _SIGMOND_IMPORT_ERROR = _sigmond_err
+
+import QC2.hpw_fit_task
 
 # Thanks to Drew and https://stackoverflow.com/a/48201163/191474
 #ends code when run logging.error(message) or logging.critical(message)
@@ -52,23 +62,29 @@ SIGMOND_TASKS = [ #manage which classes to use for each unique task -> change fo
     # tm.Task.toy_corrs,
 ]                            
 TASK_MAP = { #manage which classes to use for each unique task -> change for selection (fvspectrum)
-    tm.Task.preview_corrs: fvspectrum.sigmond_view_corrs.SigmondPreviewCorrs,
-    tm.Task.average_corrs: fvspectrum.sigmond_average_corrs.SigmondAverageCorrs,
-    tm.Task.rotate_corrs: fvspectrum.sigmond_rotate_corrs.SigmondRotateCorrs,
-    tm.Task.fit_spectrum: fvspectrum.sigmond_spectrum_fits.SigmondSpectrumFits,
-    # tm.Task.toy_corrs: fvspectrum.generate_toy_correlators.GenerateToyCorrs,
-    tm.Task.compare_spectrums: fvspectrum.compare_sigmond_levels.CompareLevels,
-    tm.Task.single_channel_fit: QC2.run_HPW_fit.HPWFitTask,
+    tm.Task.single_channel_fit: QC2.hpw_fit_task.HPWFitTask,
 }
 TASK_DOC = { #imports documentation from each task
-    tm.Task.preview_corrs: fvspectrum.sigmond_view_corrs.doc,
-    tm.Task.average_corrs: fvspectrum.sigmond_average_corrs.doc,
-    tm.Task.rotate_corrs: fvspectrum.sigmond_rotate_corrs.doc,
-    tm.Task.fit_spectrum: fvspectrum.sigmond_spectrum_fits.doc,
-    # tm.Task.toy_corrs: fvspectrum.generate_toy_correlators.doc,
-    tm.Task.compare_spectrums: fvspectrum.compare_sigmond_levels.doc,
-    tm.Task.single_channel_fit: QC2.run_HPW_fit.doc,
+    tm.Task.single_channel_fit: QC2.hpw_fit_task.doc,
 }
+
+if SIGMOND_AVAILABLE:
+    TASK_MAP.update({
+        tm.Task.preview_corrs: fvspectrum.sigmond_view_corrs.SigmondPreviewCorrs,
+        tm.Task.average_corrs: fvspectrum.sigmond_average_corrs.SigmondAverageCorrs,
+        tm.Task.rotate_corrs: fvspectrum.sigmond_rotate_corrs.SigmondRotateCorrs,
+        tm.Task.fit_spectrum: fvspectrum.sigmond_spectrum_fits.SigmondSpectrumFits,
+        # tm.Task.toy_corrs: fvspectrum.generate_toy_correlators.GenerateToyCorrs,
+        tm.Task.compare_spectrums: fvspectrum.compare_sigmond_levels.CompareLevels,
+    })
+    TASK_DOC.update({
+        tm.Task.preview_corrs: fvspectrum.sigmond_view_corrs.doc,
+        tm.Task.average_corrs: fvspectrum.sigmond_average_corrs.doc,
+        tm.Task.rotate_corrs: fvspectrum.sigmond_rotate_corrs.doc,
+        tm.Task.fit_spectrum: fvspectrum.sigmond_spectrum_fits.doc,
+        # tm.Task.toy_corrs: fvspectrum.generate_toy_correlators.doc,
+        tm.Task.compare_spectrums: fvspectrum.compare_sigmond_levels.doc,
+    })
 
 #set required general parameters 
 #items in list must be str or {str: list of str}
@@ -116,6 +132,12 @@ class PyCALQ:
                     sigmond_tasks.append(TASK_NAMES[key[0]])
                 max_task = task_names.index(key[0]) if task_names.index(key[0])>max_task else max_task
         if sigmond_tasks:
+            if not SIGMOND_AVAILABLE:
+                logging.error(
+                    f"Tasks {[t.name for t in sigmond_tasks]} need sigmond, which failed to "
+                    f"import ({_SIGMOND_IMPORT_ERROR}). Install the sigmond pybindings, or "
+                    "run only the single_channel_fit task."
+                )
             self.sig_proj_hand = sph.SigmondProjectHandler(self.general_configs,sigmond_tasks)
 
         for task in TASK_ORDER[:max_task+1]:
@@ -127,6 +149,11 @@ class PyCALQ:
             task_name = list(task_config.keys())[0] #root
             if task_name in TASK_NAMES:
                 task = TASK_NAMES[task_name]
+                if task not in TASK_MAP:
+                    logging.error(
+                        f"Task '{task.name}' is unavailable in this installation. "
+                        "It requires sigmond, which failed to import."
+                    )
                 self.proj_dir.set_task(task.value, task.name)
 
                 #print documentation if requested
